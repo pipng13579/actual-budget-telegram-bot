@@ -1,0 +1,21 @@
+{
+  "name": "actual-budget-telegram-bot",
+  "version": "1.0.0",
+  "description": "Telegram bot for household expense tracking with Actual Budget. No LLMs, no AI costs. Multi-user, receipt scanning, auto-learning, tags, transfers, daily nudge.",
+  "main": "bot.js",
+  "type": "module",
+  "scripts": {
+    "start": "node bot.js"
+  },
+  "keywords": [
+    "actual-budget", "telegram-bot", "expense-tracker", "budget",
+    "receipt-scanner", "household-finance", "no-llm", "self-hosted"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "@actual-app/api": "^26.3.0",
+    "@google-cloud/vision": "^4.3.2",
+    "node-telegram-bot-api": "^0.66.0",
+    "dotenv": "^16.4.5"
+  }
+}

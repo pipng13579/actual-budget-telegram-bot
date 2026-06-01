@@ -1,0 +1,14 @@
+# Rename 'my-budget-bot' to your app name after running: fly launch
+app = 'my-budget-bot'
+
+# Change to your nearest region: https://fly.io/docs/reference/regions/
+primary_region = 'iad'
+
+[build]
+
+[processes]
+  app = "sh -c 'echo \"$GCP_KEY_BASE64\" | base64 -d > /app/gcp-key.json && export GOOGLE_APPLICATION_CREDENTIALS=/app/gcp-key.json && node bot.js'"
+
+[[vm]]
+  size = 'shared-cpu-1x'
+  memory = '256mb'
