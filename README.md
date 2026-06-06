@@ -82,48 +82,83 @@ cd actual-budget-telegram-bot
 
 # Configure
 cp .env.example .env
-# Edit .env with your tokens, IDs, and account mappings
-
-# Customize categories in parser.js and accounts in bot.js
+# Edit .env with Telegram IDs, Actual sync IDs, encryption passwords,
+# family group chat ID, and account mappings for each budget file
 
 # Run
 npm install
 node bot.js
 ```
 
+### Multi-budget routing
+
+Configure three Actual budget files in `.env`:
+
+| Chat | Budget file |
+|---|---|
+| User 1 private chat with the bot | `BUDGET_USER1_*` |
+| User 2 private chat with the bot | `BUDGET_USER2_*` |
+| Configured family group chat | `BUDGET_FAMILY_*` |
+
+Each budget file can have its own sync ID and optional end-to-end encryption password:
+
+```env
+BUDGET_USER1_SYNC_ID=...
+BUDGET_USER1_ENCRYPTION_PASSWORD=...
+
+BUDGET_USER2_SYNC_ID=...
+# no encryption password needed if this file is not encrypted
+
+BUDGET_FAMILY_SYNC_ID=...
+BUDGET_FAMILY_ENCRYPTION_PASSWORD=...
+```
+
+In the shared family budget, each user can have a different default account:
+
+```env
+BUDGET_FAMILY_ACCOUNTS=user1:actual-account-id:User 1 Family Account;user2:actual-account-id:User 2 Family Account;joint:actual-account-id:Joint Account
+BUDGET_FAMILY_USER1_DEFAULT_ACCOUNT=user1
+BUDGET_FAMILY_USER2_DEFAULT_ACCOUNT=user2
+```
+
 ### Get your IDs
 
 | What | Where |
 |---|---|
-| Telegram bot token | @BotFather on Telegram → `/newbot` |
+| Telegram bot token | @BotFather on Telegram -> `/newbot` |
 | Telegram user IDs | @userinfobot on Telegram |
-| Actual Budget Sync ID | Settings → Show advanced settings |
+| Actual Budget Sync IDs | Settings -> Show advanced settings, once per budget file |
 | Account IDs | Click an account in Actual, check the URL |
-| Google Vision key | [Cloud Console](https://console.cloud.google.com) → Vision API → Service Account → JSON key |
+| Family group chat ID | Add @raw_data_bot to the Telegram group |
+| Google Vision key | [Cloud Console](https://console.cloud.google.com) -> Vision API -> Service Account -> JSON key |
 
 ### Create a Telegram group
 
-Create a group → add household members + the bot → make bot admin → start texting.
+Create a group -> add household members + the bot -> make bot admin -> set `FAMILY_GROUP_CHAT_ID` -> start texting.
 
 
 ## 📱 Usage
 
 ### Logging expenses
 
+Message the bot privately to update your individual budget file. Message the configured family group to update the shared family budget file.
+
 ```
-lunch 12.50                    → Food & Drinks, default account
-lunch 12.50 credit             → Food & Drinks, Credit Card
-uber home 15                   → Transportation, default account
-groceries 67.30 joint          → Groceries, Joint Account
-dinner 45 #date                → Food & Drinks, tagged #date
-[receipt photo]                → OCR reads total, asks which account
+lunch 12.50                    -> Food & Drinks, default account for this chat/budget
+lunch 12.50 credit             -> Food & Drinks, Credit Card
+uber home 15                   -> Transportation, default account
+groceries 67.30 joint          -> Groceries, Joint Account
+dinner 45 #date                -> Food & Drinks, tagged #date
+[receipt photo]                -> OCR reads total, asks which account
 ```
 
 ### Transfers
 
 ```
-transfer 500 savings credit    → -$500 Savings, +$500 Credit Card
+transfer 500 savings credit    -> -$500 Savings, +$500 Credit Card
 ```
+
+Transfers only work within the budget file routed for the current chat.
 
 ### Tags
 
@@ -203,6 +238,8 @@ Run the Docker container on any always-on machine (NAS, Raspberry Pi, old laptop
 
 Set `WEEKLY_SUMMARY_CHAT_ID` in your environment. Daily nudge uses the same chat ID by default.
 
+For multi-budget setups, also set `WEEKLY_SUMMARY_BUDGET_KEY` and `DAILY_NUDGE_BUDGET_KEY` to `user1`, `user2`, or `family` when the chat ID alone is not enough to infer the target budget.
+
 
 ## 🧠 Auto-learning
 
@@ -210,14 +247,16 @@ The bot starts with built-in keywords (uber → Transportation, netflix → Subs
 
 When it encounters something new like "acai", it asks you to pick a category. Your choice is **saved permanently**. Next time "acai" appears, it auto-categorizes instantly.
 
-Learned keywords persist across bot restarts in `learned-keywords.json`.
+Learned keywords persist across bot restarts separately per budget file, such as `learned-keywords-user1.json`, `learned-keywords-user2.json`, and `learned-keywords-family.json`.
 
 
 ## 🛠️ Customization
 
-**Categories:** Edit `KEYWORD_MAP` in `parser.js`. Names must match your Actual Budget categories exactly.
+**Categories:** Edit `KEYWORD_MAP` in `parser.js` for built-in keyword hints. The bot uses the active Actual budget file's categories for keyboards and validation.
 
-**Accounts:** Edit `ACCOUNTS` and `USER_MAP` in `bot.js` to match your household.
+**Accounts:** Configure account mappings in `.env` with `BUDGET_USER1_ACCOUNTS`, `BUDGET_USER2_ACCOUNTS`, and `BUDGET_FAMILY_ACCOUNTS`.
+
+**Family defaults:** Use `BUDGET_FAMILY_USER1_DEFAULT_ACCOUNT` and `BUDGET_FAMILY_USER2_DEFAULT_ACCOUNT` so each user has their own default account inside the shared family budget file.
 
 **Fixed expenses:** Edit `FIXED_CATEGORIES` in `bot.js` for the `/fixed` command.
 

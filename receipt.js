@@ -125,7 +125,7 @@ function extractStoreName(ocrText) {
 // Takes an image buffer, returns a structured expense
 // ------------------------------------------------------------
 
-export async function parseReceipt(imageBuffer) {
+export async function parseReceipt(imageBuffer, budgetKey = 'default') {
   if (!client) {
     return { error: 'Google Vision not configured' };
   }
@@ -142,7 +142,7 @@ export async function parseReceipt(imageBuffer) {
 
     // Use the keyword parser to detect category from store name + full text
     const searchText = `${storeName || ''} ${ocrText}`.substring(0, 200);
-    const parsed = parseExpenseText(searchText);
+    const parsed = parseExpenseText(searchText, budgetKey);
 
     return {
       amount: total,

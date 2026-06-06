@@ -4,39 +4,67 @@
 // into structured expense objects. No AI, no API calls.
 //
 // LEARNING: When the bot asks for a category and the user picks
-// one, the keyword is saved to learned-keywords.json. Next time
-// the same word appears, it auto-categorizes.
+// one, the keyword is saved to a learned-keywords file scoped
+// to the active budget. Next time it appears in that budget, it
+// auto-categorizes without leaking into other budget files.
 // ============================================================
 
-import { readFileSync, writeFileSync, existsSync } from 'fs';
+import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs';
+import { join } from 'path';
 
-const LEARNED_FILE = '/tmp/actual-data/learned-keywords.json';
+const LEARNED_DIR = process.env.ACTUAL_DATA_DIR || '/tmp/actual-data';
 
 // Load learned keywords from disk
-let learnedKeywords = {};
+const learnedKeywordsByBudget = new Map();
 
-export function loadLearnedKeywords() {
+function safeBudgetKey(budgetKey = 'default') {
+  return String(budgetKey).replace(/[^a-zA-Z0-9_-]/g, '_') || 'default';
+}
+
+function learnedFileForBudget(budgetKey) {
+  return join(LEARNED_DIR, `learned-keywords-${safeBudgetKey(budgetKey)}.json`);
+}
+
+function getLearnedKeywords(budgetKey) {
+  const key = safeBudgetKey(budgetKey);
+  if (!learnedKeywordsByBudget.has(key)) {
+    loadLearnedKeywords(key);
+  }
+  return learnedKeywordsByBudget.get(key) || {};
+}
+
+export function loadLearnedKeywords(budgetKey = 'default') {
+  const key = safeBudgetKey(budgetKey);
+  const learnedFile = learnedFileForBudget(key);
+
   try {
-    if (existsSync(LEARNED_FILE)) {
-      learnedKeywords = JSON.parse(readFileSync(LEARNED_FILE, 'utf-8'));
+    if (existsSync(learnedFile)) {
+      const learnedKeywords = JSON.parse(readFileSync(learnedFile, 'utf-8'));
+      learnedKeywordsByBudget.set(key, learnedKeywords);
       const count = Object.keys(learnedKeywords).length;
-      if (count > 0) console.log(`Loaded ${count} learned keywords.`);
+      if (count > 0) console.log(`Loaded ${count} learned keywords for ${key}.`);
+    } else {
+      learnedKeywordsByBudget.set(key, {});
     }
   } catch (err) {
-    console.error('Failed to load learned keywords:', err.message);
-    learnedKeywords = {};
+    console.error(`Failed to load learned keywords for ${key}:`, err.message);
+    learnedKeywordsByBudget.set(key, {});
   }
 }
 
 // Save a new keyword -> category mapping
-export function learnKeyword(keyword, category) {
+export function learnKeyword(budgetKey, keyword, category) {
+  const safeKey = safeBudgetKey(budgetKey);
   const key = keyword.toLowerCase().trim();
   if (!key || key.length < 2) return; // skip tiny/empty words
 
+  const learnedKeywords = { ...getLearnedKeywords(safeKey) };
   learnedKeywords[key] = category;
+  learnedKeywordsByBudget.set(safeKey, learnedKeywords);
 
   try {
-    writeFileSync(LEARNED_FILE, JSON.stringify(learnedKeywords, null, 2));
+    mkdirSync(LEARNED_DIR, { recursive: true });
+    writeFileSync(learnedFileForBudget(safeKey), JSON.stringify(learnedKeywords, null, 2));
   } catch (err) {
     console.error('Failed to save learned keyword:', err.message);
   }
@@ -154,8 +182,9 @@ function extractAmount(text) {
 // Checks the message against keyword lists
 // ------------------------------------------------------------
 
-function detectCategory(text) {
+function detectCategory(text, budgetKey = 'default') {
   const lower = text.toLowerCase();
+  const learnedKeywords = getLearnedKeywords(budgetKey);
 
   // Check learned keywords first (user-taught mappings)
   for (const [keyword, category] of Object.entries(learnedKeywords)) {
@@ -207,9 +236,9 @@ function buildDescription(text, amount) {
 // Takes a raw text message, returns a structured expense or null
 // ------------------------------------------------------------
 
-export function parseExpenseText(text) {
+export function parseExpenseText(text, budgetKey = 'default') {
   const amount = extractAmount(text);
-  const category = detectCategory(text);
+  const category = detectCategory(text, budgetKey);
   const description = buildDescription(text, amount);
 
   return {
@@ -222,5 +251,5 @@ export function parseExpenseText(text) {
   };
 }
 
-// Export the category list for Telegram keyboard buttons
-export const ALL_CATEGORIES = Object.keys(KEYWORD_MAP);
+// Export the built-in category list as a fallback when Actual categories are unavailable.
+export const BUILTIN_CATEGORIES = Object.keys(KEYWORD_MAP);
