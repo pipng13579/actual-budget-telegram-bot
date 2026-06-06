@@ -146,11 +146,25 @@ Message the bot privately to update your individual budget file. Message the con
 ```
 lunch 12.50                    -> Food & Drinks, default account for this chat/budget
 lunch 12.50 credit             -> Food & Drinks, Credit Card
+30/5 lunch 12.50 credit        -> Logs on May 30 of the current year
+lunch 12.50 credit 30 May      -> Date can also go at the back
+today lunch 12.50 credit       -> Logs today
+coffee 5.50 yesterday          -> Logs yesterday
+groceries 45.30 5 days ago     -> Logs five days ago
+Starbucks 6.20 credit team coffee #food -> Payee, amount, account, notes, category hint
 uber home 15                   -> Transportation, default account
 groceries 67.30 joint          -> Groceries, Joint Account
 grab 12 #transport             -> matches Transport/Transportation in this budget
 [receipt photo]                -> OCR reads total, asks which account
 ```
+
+Text format is:
+
+```text
+<date optional> <payee> <amount> <account optional> <notes optional> #<category optional>
+```
+
+The date can be at the front or back, for example `30/5`, `30/05/26`, `30 May`, `today`, `yesterday`, or `5 days ago`. Anything before the amount becomes the Actual payee. Anything after the amount is interpreted as account keyword, category hashtag, and remaining notes.
 
 ### Transfers
 

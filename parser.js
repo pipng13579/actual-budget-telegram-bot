@@ -150,6 +150,165 @@ const KEYWORD_MAP = {
 };
 
 // ------------------------------------------------------------
+// DATE EXTRACTION
+// Supports front/back dates like:
+// "30/5", "30/05/26", "30 May", "30 May 2026"
+// "today", "yesterday", "5 days ago"
+// ------------------------------------------------------------
+
+const MONTHS = {
+  jan: 1,
+  january: 1,
+  feb: 2,
+  february: 2,
+  mar: 3,
+  march: 3,
+  apr: 4,
+  april: 4,
+  may: 5,
+  jun: 6,
+  june: 6,
+  jul: 7,
+  july: 7,
+  aug: 8,
+  august: 8,
+  sep: 9,
+  sept: 9,
+  september: 9,
+  oct: 10,
+  october: 10,
+  nov: 11,
+  november: 11,
+  dec: 12,
+  december: 12,
+};
+
+function normalizeYear(yearText) {
+  if (!yearText) return new Date().getFullYear();
+
+  const year = Number(yearText);
+  if (yearText.length === 2) return 2000 + year;
+  return year;
+}
+
+function formatDate(year, month, day) {
+  const date = new Date(year, month - 1, day);
+  if (
+    date.getFullYear() !== year ||
+    date.getMonth() !== month - 1 ||
+    date.getDate() !== day
+  ) {
+    return null;
+  }
+
+  return [
+    String(year).padStart(4, '0'),
+    String(month).padStart(2, '0'),
+    String(day).padStart(2, '0'),
+  ].join('-');
+}
+
+function formatDateObject(date) {
+  return [
+    String(date.getFullYear()).padStart(4, '0'),
+    String(date.getMonth() + 1).padStart(2, '0'),
+    String(date.getDate()).padStart(2, '0'),
+  ].join('-');
+}
+
+function daysAgo(days) {
+  const date = new Date();
+  date.setDate(date.getDate() - days);
+  return formatDateObject(date);
+}
+
+function parseRelativeDateMatch(match, type) {
+  if (type === 'today') return formatDateObject(new Date());
+  if (type === 'yesterday') return daysAgo(1);
+  if (type === 'daysAgo') return daysAgo(Number(match[1]));
+  return null;
+}
+
+function parseDateMatch(match, type) {
+  if (type === 'numeric') {
+    const day = Number(match[1]);
+    const month = Number(match[2]);
+    const year = normalizeYear(match[3]);
+    return formatDate(year, month, day);
+  }
+
+  const day = Number(match[1]);
+  const month = MONTHS[match[2].toLowerCase()];
+  const year = normalizeYear(match[3]);
+  return formatDate(year, month, day);
+}
+
+function extractDate(text) {
+  const patterns = [
+    {
+      type: 'today',
+      relative: true,
+      front: /^\s*(today)\b\s*/i,
+      back: /\s+\b(today)\s*$/i,
+    },
+    {
+      type: 'yesterday',
+      relative: true,
+      front: /^\s*(yesterday)\b\s*/i,
+      back: /\s+\b(yesterday)\s*$/i,
+    },
+    {
+      type: 'daysAgo',
+      relative: true,
+      front: /^\s*(\d+)\s+days?\s+ago\b\s*/i,
+      back: /\s+\b(\d+)\s+days?\s+ago\s*$/i,
+    },
+    {
+      type: 'numeric',
+      front: /^\s*(\d{1,2})[/-](\d{1,2})(?:[/-](\d{2,4}))?\b\s*/i,
+      back: /\s+\b(\d{1,2})[/-](\d{1,2})(?:[/-](\d{2,4}))?\s*$/i,
+    },
+    {
+      type: 'month',
+      front: /^\s*(\d{1,2})\s+(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t|tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)(?:\s+(\d{2,4}))?\b\s*/i,
+      back: /\s+\b(\d{1,2})\s+(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t|tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)(?:\s+(\d{2,4}))?\s*$/i,
+    },
+  ];
+
+  for (const pattern of patterns) {
+    const front = text.match(pattern.front);
+    if (front) {
+      const date = pattern.relative
+        ? parseRelativeDateMatch(front, pattern.type)
+        : parseDateMatch(front, pattern.type);
+      if (date) {
+        return {
+          date,
+          text: text.slice(front[0].length).replace(/\s+/g, ' ').trim(),
+        };
+      }
+    }
+  }
+
+  for (const pattern of patterns) {
+    const back = text.match(pattern.back);
+    if (back) {
+      const date = pattern.relative
+        ? parseRelativeDateMatch(back, pattern.type)
+        : parseDateMatch(back, pattern.type);
+      if (date) {
+        return {
+          date,
+          text: text.slice(0, back.index).replace(/\s+/g, ' ').trim(),
+        };
+      }
+    }
+  }
+
+  return { date: null, text: text.trim() };
+}
+
+// ------------------------------------------------------------
 // AMOUNT EXTRACTION
 // Finds numbers in the message. Handles formats like:
 // "12", "12.50", "$12.50", "USD 12.50", "12.5"
@@ -157,24 +316,44 @@ const KEYWORD_MAP = {
 // ------------------------------------------------------------
 
 function extractAmount(text) {
-  // Match currency patterns first: $12.50, USD12.50, EUR 12.50
-  const currencyMatch = text.match(/(?:\$|USD|EUR|GBP|SGD|INR|AUD|CAD)\s*(\d+(?:\.\d{1,2})?)/i);
-  if (currencyMatch) return parseFloat(currencyMatch[1]);
+  const candidates = [];
+  const currencyRegex = /(?:\$|USD|EUR|GBP|SGD|INR|AUD|CAD)\s*(\d+(?:\.\d{1,2})?)/gi;
+  const numberRegex = /\b(\d+(?:\.\d{1,2})?)\b/g;
 
-  // Match standalone numbers (not part of a longer word)
-  const numbers = text.match(/\b(\d+(?:\.\d{1,2})?)\b/g);
-  if (!numbers) return null;
+  let match;
+  while ((match = currencyRegex.exec(text)) !== null) {
+    const amount = parseFloat(match[1]);
+    if (amount > 0 && amount < 100000) {
+      candidates.push({
+        amount,
+        index: match.index,
+        end: match.index + match[0].length,
+        type: 'currency',
+      });
+    }
+  }
 
-  // If multiple numbers, take the one that looks most like a price
-  // (filter out things that look like dates, times, etc.)
-  const prices = numbers
-    .map(Number)
-    .filter((n) => n > 0 && n < 100000); // reasonable expense range
+  while ((match = numberRegex.exec(text)) !== null) {
+    const amount = parseFloat(match[1]);
+    if (amount > 0 && amount < 100000) {
+      candidates.push({
+        amount,
+        index: match.index,
+        end: match.index + match[0].length,
+        type: match[1].includes('.') ? 'decimal' : 'integer',
+      });
+    }
+  }
 
-  if (prices.length === 0) return null;
+  if (candidates.length === 0) return null;
 
-  // Return the last number in the message (people usually type "thing amount")
-  return prices[prices.length - 1];
+  const currency = candidates.filter((candidate) => candidate.type === 'currency');
+  if (currency.length > 0) return currency.sort((a, b) => a.index - b.index)[0];
+
+  const decimals = candidates.filter((candidate) => candidate.type === 'decimal');
+  if (decimals.length > 0) return decimals.sort((a, b) => a.index - b.index)[0];
+
+  return candidates.sort((a, b) => b.index - a.index)[0];
 }
 
 // ------------------------------------------------------------
@@ -217,16 +396,10 @@ function detectCategory(text, budgetKey = 'default') {
 // Removes the amount and common filler words
 // ------------------------------------------------------------
 
-function buildDescription(text, amount) {
-  let desc = text
-    .replace(/(?:\$|USD|EUR|GBP|SGD|INR|AUD|CAD)\s*\d+(?:\.\d{1,2})?/gi, '') // remove currency + amount
-    .replace(/\b\d+(?:\.\d{1,2})?\b/g, '')                     // remove standalone numbers
+function cleanDescription(text) {
+  const desc = text
     .replace(/\s+/g, ' ')                                        // collapse whitespace
     .trim();
-
-  // Cap at 5 words
-  const words = desc.split(' ').slice(0, 5);
-  desc = words.join(' ');
 
   return desc || 'expense';
 }
@@ -237,14 +410,20 @@ function buildDescription(text, amount) {
 // ------------------------------------------------------------
 
 export function parseExpenseText(text, budgetKey = 'default') {
-  const amount = extractAmount(text);
-  const category = detectCategory(text, budgetKey);
-  const description = buildDescription(text, amount);
+  const dateResult = extractDate(text);
+  const amountMatch = extractAmount(dateResult.text);
+  const amount = amountMatch ? amountMatch.amount : null;
+  const beforeAmount = amountMatch ? dateResult.text.slice(0, amountMatch.index) : dateResult.text;
+  const afterAmount = amountMatch ? dateResult.text.slice(amountMatch.end) : '';
+  const description = cleanDescription(beforeAmount);
+  const category = detectCategory(`${beforeAmount} ${afterAmount}`, budgetKey);
 
   return {
     amount,
+    date: dateResult.date,
     category,
     description,
+    trailingText: afterAmount.replace(/\s+/g, ' ').trim(),
     currency: 'USD', // Change to your currency,
     needsCategory: category === null,
     needsAmount: amount === null,

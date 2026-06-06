@@ -486,12 +486,13 @@ async function addToActual(context, expense, account) {
     return await withBudget(context.budgetKey, async (state) => {
       const categoryId = expense.category ? findCategoryId(state, expense.category) : null;
       const amount = Math.round(expense.amount * -100); // cents, negative for expense
-      const today = new Date().toISOString().split('T')[0];
-      const notes = `Added by ${context.user.name} via Telegram to ${context.budget.label}`;
+      const transactionDate = expense.date || new Date().toISOString().split('T')[0];
+      const userNotes = expense.notes ? ` | Notes: ${expense.notes}` : '';
+      const notes = `Added by ${context.user.name} via Telegram to ${context.budget.label}${userNotes}`;
 
       await actualApi.importTransactions(account.id, [
         {
-          date: today,
+          date: transactionDate,
           amount,
           payee_name: expense.description,
           category: categoryId,
@@ -501,7 +502,7 @@ async function addToActual(context, expense, account) {
 
       await actualApi.sync();
 
-      const txns = await actualApi.getTransactions(account.id, today, today);
+      const txns = await actualApi.getTransactions(account.id, transactionDate, transactionDate);
       const match = txns
         .slice()
         .reverse()
@@ -516,6 +517,7 @@ async function addToActual(context, expense, account) {
         amount: expense.amount,
         category: expense.category,
         description: expense.description,
+        date: transactionDate,
       };
     });
   } catch (err) {
@@ -604,22 +606,25 @@ function accountKeyboard(context) {
   return { reply_markup: { keyboard: buttons, one_time_keyboard: true, resize_keyboard: true } };
 }
 
-function extractAccount(text, context) {
-  const words = text.trim().split(/\s+/);
-  const lastWord = words[words.length - 1]?.toLowerCase();
+function extractPostAmountDetails(trailingText, context) {
+  const words = trailingText.trim().split(/\s+/).filter(Boolean);
+  let accountKey = null;
+  const noteWords = [];
 
-  if (lastWord && context.accountKeys.includes(lastWord) && context.budget.accounts[lastWord]) {
-    return {
-      accountKey: lastWord,
-      account: context.budget.accounts[lastWord],
-      cleanText: words.slice(0, -1).join(' '),
-    };
+  for (const word of words) {
+    const normalized = word.toLowerCase().replace(/^[^\w]+|[^\w]+$/g, '');
+    if (!accountKey && context.accountKeys.includes(normalized) && context.budget.accounts[normalized]) {
+      accountKey = normalized;
+      continue;
+    }
+    noteWords.push(word);
   }
 
+  const selectedKey = accountKey || context.defaultAccountKey;
   return {
-    accountKey: context.defaultAccountKey,
-    account: context.budget.accounts[context.defaultAccountKey],
-    cleanText: text,
+    accountKey: selectedKey,
+    account: context.budget.accounts[selectedKey],
+    notes: noteWords.join(' ').trim(),
   };
 }
 
@@ -688,6 +693,8 @@ async function confirmExpense(context, expense, account) {
   const synced = result && result.synced;
   const icon = synced ? 'OK' : 'Draft';
   const syncNote = synced ? '' : '\n(Not synced to Actual Budget)';
+  const dateLine = expense.date ? `Date: ${expense.date}\n` : '';
+  const notesLine = expense.notes ? `\nNotes: ${expense.notes}` : '';
 
   if (result?.transactionId) {
     lastExpense.set(lastExpenseKey(context), result);
@@ -697,10 +704,11 @@ async function confirmExpense(context, expense, account) {
     context.chatId,
     `${icon} Logged, ${context.user.name}!\n\n` +
       `Budget: ${context.budget.label}\n` +
-      `Amount: $${expense.amount.toFixed(2)} ${expense.currency}\n` +
+      dateLine +
+      `Amount: $${expense.amount.toFixed(2)}\n` +
       `Category: ${expense.category}\n` +
       `Account: ${account.label}\n` +
-      `What: ${expense.description}${syncNote}`,
+      `What: ${expense.description}${notesLine}${syncNote}`,
     removeKeyboard()
   );
 }
@@ -884,9 +892,9 @@ bot.onText(/\/start/, async (msg) => {
       `Text expenses like:\n` +
       `"lunch 12.50"\n` +
       `"uber to office 8"\n` +
-      `"groceries 45.30"\n\n` +
-      `Add an account keyword at the end:\n` +
-      `"lunch 12.50 credit"\n\n` +
+      `"30/5 groceries 45.30 credit weekly shop #grocery"\n\n` +
+      `Format: optional date, payee, amount, then optional account, notes, and #category.\n` +
+      `The date can also go at the back.\n\n` +
       `Use a hashtag as a category hint:\n` +
       `"grab 12 #transport"\n\n` +
       `Private chats update personal budget files. The configured family group updates the shared family file.\n\n` +
@@ -929,6 +937,7 @@ bot.onText(/\/help/, async (msg) => {
       `Examples:\n` +
       `"coffee 5.50"\n` +
       `"uber home 15 credit"\n` +
+      `"30 May Starbucks 6.20 credit team coffee #food"\n` +
       `"grab 12 #transport"\n` +
       `"transfer 500 savings credit"\n\n` +
       `Hashtags are category hints matched against this budget file's Actual categories.\n\n` +
@@ -1454,8 +1463,10 @@ bot.on('message', async (msg) => {
   }
 
   const categoryHint = await extractCategoryHint(msg.text, context);
-  const { account, cleanText } = extractAccount(categoryHint.cleanText, context);
-  let expense = parseExpenseText(cleanText, context.budgetKey);
+  let expense = parseExpenseText(categoryHint.cleanText, context.budgetKey);
+  const postAmountDetails = extractPostAmountDetails(expense.trailingText || '', context);
+  const account = postAmountDetails.account;
+  expense.notes = postAmountDetails.notes;
 
   if (categoryHint.category) {
     expense.category = categoryHint.category;
