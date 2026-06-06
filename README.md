@@ -33,7 +33,7 @@ This bot solves the input problem. Your daily interaction is just **texting a Te
 | 👥 **Multi-user** | Shared Telegram group, expenses route to the right person |
 | 💳 **Multi-account** | Add a keyword to pick the bank/card |
 | 🧠 **Auto-learning** | Asks once for unknown words, remembers forever |
-| 🏷️ **Tags** | `dinner 45 #bali` then `/tag bali` to see trip totals |
+| 🏷️ **Category hints** | `grab 12 #transport` matches the active budget file's Actual categories |
 | 🔄 **Transfers** | `transfer 500 savings credit` moves money between accounts |
 | ❓ **Natural language** | `how much on food this month?` or `what did I spend today?` |
 | 👤 **Personal queries** | "I" = your spending, "we" = household total |
@@ -148,7 +148,7 @@ lunch 12.50                    -> Food & Drinks, default account for this chat/b
 lunch 12.50 credit             -> Food & Drinks, Credit Card
 uber home 15                   -> Transportation, default account
 groceries 67.30 joint          -> Groceries, Joint Account
-dinner 45 #date                -> Food & Drinks, tagged #date
+grab 12 #transport             -> matches Transport/Transportation in this budget
 [receipt photo]                -> OCR reads total, asks which account
 ```
 
@@ -160,13 +160,14 @@ transfer 500 savings credit    -> -$500 Savings, +$500 Credit Card
 
 Transfers only work within the budget file routed for the current chat.
 
-### Tags
+### Category hints
 
 ```
-flights 300 #bali              → tagged
-hotel 150 #bali                → tagged
-/tag bali                      → shows all #bali expenses + total
+grab 12 #transport             -> Transportation, if it is the only best match
+grab 12 #trans                 -> asks you to choose if multiple categories match
 ```
+
+Hashtags are not stored as tags. They are stripped from the description and used only to select a category from the specific Actual budget file routed for the current chat.
 
 ### Natural language queries
 
@@ -189,7 +190,6 @@ hotel 150 #bali                → tagged
 | `/spend` | All categories ranked vs last month |
 | `/spend food` | Drill into one category |
 | `/fixed` | Recurring costs |
-| `/tag bali` | Tagged expenses |
 | `/undo` | Delete last entry |
 | `/accounts` | Your accounts + keywords |
 | `/categories` | All categories |

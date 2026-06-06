@@ -378,16 +378,76 @@ async function getCategoryNamesForBudget(budgetKey) {
 function resolveCategoryName(categoryName, categoryNames) {
   if (!categoryName) return null;
 
-  const exact = categoryNames.find((cat) => cat.toLowerCase() === categoryName.toLowerCase());
+  return findSingleCategoryMatch(categoryName, categoryNames);
+}
+
+function normalizeCategoryText(text) {
+  return String(text || '')
+    .toLowerCase()
+    .replace(/&/g, 'and')
+    .replace(/[^a-z0-9]+/g, '');
+}
+
+function levenshteinDistance(a, b) {
+  const rows = Array.from({ length: a.length + 1 }, (_, index) => [index]);
+  for (let j = 1; j <= b.length; j++) rows[0][j] = j;
+
+  for (let i = 1; i <= a.length; i++) {
+    for (let j = 1; j <= b.length; j++) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      rows[i][j] = Math.min(
+        rows[i - 1][j] + 1,
+        rows[i][j - 1] + 1,
+        rows[i - 1][j - 1] + cost
+      );
+    }
+  }
+
+  return rows[a.length][b.length];
+}
+
+function onlyMatch(matches) {
+  const unique = [...new Set(matches)];
+  return unique.length === 1 ? unique[0] : null;
+}
+
+function findSingleCategoryMatch(input, categoryNames) {
+  const query = normalizeCategoryText(input);
+  if (!query) return null;
+
+  const normalized = categoryNames.map((category) => ({
+    category,
+    normalized: normalizeCategoryText(category),
+  }));
+
+  const exact = onlyMatch(
+    normalized
+      .filter(({ normalized: category }) => category === query)
+      .map(({ category }) => category)
+  );
   if (exact) return exact;
 
-  const lower = categoryName.toLowerCase();
-  return (
-    categoryNames.find((cat) => {
-      const catLower = cat.toLowerCase();
-      return catLower.includes(lower) || lower.includes(catLower);
-    }) || null
+  const contains = onlyMatch(
+    normalized
+      .filter(({ normalized: category }) => category.includes(query) || query.includes(category))
+      .map(({ category }) => category)
   );
+  if (contains) return contains;
+
+  const scored = normalized
+    .map(({ category, normalized: candidate }) => ({
+      category,
+      score: levenshteinDistance(query, candidate),
+      length: Math.max(query.length, candidate.length),
+    }))
+    .filter(({ score, length }) => score <= Math.max(1, Math.floor(length * 0.25)))
+    .sort((a, b) => a.score - b.score);
+
+  if (scored.length === 0) return null;
+
+  const bestScore = scored[0].score;
+  const best = scored.filter(({ score }) => score === bestScore);
+  return onlyMatch(best.map(({ category }) => category));
 }
 
 function findCategoryId(state, categoryName) {
@@ -427,10 +487,7 @@ async function addToActual(context, expense, account) {
       const categoryId = expense.category ? findCategoryId(state, expense.category) : null;
       const amount = Math.round(expense.amount * -100); // cents, negative for expense
       const today = new Date().toISOString().split('T')[0];
-      const tagStr = expense.tags?.length
-        ? ` | tags: ${expense.tags.map((tag) => '#' + tag).join(' ')}`
-        : '';
-      const notes = `Added by ${context.user.name} via Telegram to ${context.budget.label}${tagStr}`;
+      const notes = `Added by ${context.user.name} via Telegram to ${context.budget.label}`;
 
       await actualApi.importTransactions(account.id, [
         {
@@ -566,15 +623,41 @@ function extractAccount(text, context) {
   };
 }
 
-function extractTags(text) {
-  const tags = [];
-  const tagRegex = /#([a-zA-Z0-9_]+)/g;
+async function extractCategoryHint(text, context) {
+  const hints = [];
+  const hintRegex = /#([a-zA-Z0-9_]+)/g;
   let match;
-  while ((match = tagRegex.exec(text)) !== null) {
-    tags.push(match[1].toLowerCase());
+  while ((match = hintRegex.exec(text)) !== null) {
+    hints.push(match[1]);
   }
+
   const cleanText = text.replace(/#[a-zA-Z0-9_]+/g, '').replace(/\s+/g, ' ').trim();
-  return { tags, cleanText };
+  if (hints.length === 0) {
+    return { cleanText, category: null, unmatchedHints: [] };
+  }
+
+  const categories = await getCategoryNamesForBudget(context.budgetKey);
+  const matches = hints
+    .map((hint) => ({ hint, category: findSingleCategoryMatch(hint, categories) }))
+    .filter(({ category }) => category);
+  const matchedCategories = [...new Set(matches.map(({ category }) => category))];
+
+  return {
+    cleanText,
+    category: matchedCategories.length === 1 ? matchedCategories[0] : null,
+    hints,
+    matchedCategories,
+    unmatchedHints: hints.filter((hint) => !findSingleCategoryMatch(hint, categories)),
+    ambiguous: hints.length > 0 && matchedCategories.length !== 1,
+  };
+}
+
+function describeCategoryHintProblem(categoryHint, budgetLabel) {
+  const hints = categoryHint.hints?.map((hint) => '#' + hint).join(', ') || 'that hashtag';
+  if (categoryHint.matchedCategories?.length > 1) {
+    return `${hints} matched multiple categories in ${budgetLabel}. Pick one:`;
+  }
+  return `I couldn't match ${hints} to one clear category in ${budgetLabel}. Pick one:`;
 }
 
 function parseTransfer(text, context) {
@@ -610,10 +693,6 @@ async function confirmExpense(context, expense, account) {
     lastExpense.set(lastExpenseKey(context), result);
   }
 
-  const tagLine = expense.tags?.length
-    ? `\nTags: ${expense.tags.map((tag) => '#' + tag).join(' ')}`
-    : '';
-
   await bot.sendMessage(
     context.chatId,
     `${icon} Logged, ${context.user.name}!\n\n` +
@@ -621,7 +700,7 @@ async function confirmExpense(context, expense, account) {
       `Amount: $${expense.amount.toFixed(2)} ${expense.currency}\n` +
       `Category: ${expense.category}\n` +
       `Account: ${account.label}\n` +
-      `What: ${expense.description}${tagLine}${syncNote}`,
+      `What: ${expense.description}${syncNote}`,
     removeKeyboard()
   );
 }
@@ -808,8 +887,10 @@ bot.onText(/\/start/, async (msg) => {
       `"groceries 45.30"\n\n` +
       `Add an account keyword at the end:\n` +
       `"lunch 12.50 credit"\n\n` +
+      `Use a hashtag as a category hint:\n` +
+      `"grab 12 #transport"\n\n` +
       `Private chats update personal budget files. The configured family group updates the shared family file.\n\n` +
-      `Commands: /today, /month, /spend, /fixed, /tag, /undo, /accounts, /categories, /help`
+      `Commands: /today, /month, /spend, /fixed, /undo, /accounts, /categories, /help`
   );
 });
 
@@ -848,8 +929,9 @@ bot.onText(/\/help/, async (msg) => {
       `Examples:\n` +
       `"coffee 5.50"\n` +
       `"uber home 15 credit"\n` +
-      `"dinner 45 #date"\n` +
+      `"grab 12 #transport"\n` +
       `"transfer 500 savings credit"\n\n` +
+      `Hashtags are category hints matched against this budget file's Actual categories.\n\n` +
       `Ask questions like "what did I spend today?" or "how much did we spend this week?"`
   );
 });
@@ -1050,53 +1132,11 @@ bot.onText(/\/undo/, async (msg) => {
   }
 });
 
-bot.onText(/\/tag(.*)/, async (msg, match) => {
-  const context = await getContextOrReply(msg);
-  if (!context) return;
-
-  const query = (match[1] || '').trim().toLowerCase().replace('#', '');
-  if (!query) {
-    await bot.sendMessage(msg.chat.id, 'Which tag? Example: /tag bali');
-    return;
-  }
-
-  try {
-    await withBudget(context.budgetKey, async (state) => {
-      const accounts = await actualApi.getAccounts();
-      const entries = [];
-      let total = 0;
-      const now = new Date();
-      const sixMonthsAgo = new Date(now.getFullYear(), now.getMonth() - 6, 1);
-      const startDate = sixMonthsAgo.toISOString().split('T')[0];
-      const endDate = now.toISOString().split('T')[0];
-
-      for (const account of accounts) {
-        if (account.closed) continue;
-        const txns = await actualApi.getTransactions(account.id, startDate, endDate);
-        for (const txn of txns) {
-          if (txn.notes && txn.notes.toLowerCase().includes(`#${query}`)) {
-            const amt = Math.abs(txn.amount / 100);
-            total += amt;
-            const catName = (txn.category && state.categoryIdToName[txn.category]) || '';
-            entries.push(`- ${txn.date} | $${amt.toFixed(2)} | ${catName} | ${txn.imported_payee || txn.payee_name || ''}`);
-          }
-        }
-      }
-
-      if (entries.length === 0) {
-        await bot.sendMessage(msg.chat.id, `No expenses tagged #${query} in ${context.budget.label}.`);
-        return;
-      }
-
-      await bot.sendMessage(
-        msg.chat.id,
-        `${context.budget.label} #${query} expenses:\n\n${entries.join('\n')}\n\nTotal: $${total.toFixed(2)} (${entries.length} entries)`
-      );
-    });
-  } catch (err) {
-    console.error('Error in /tag:', err.message);
-    await bot.sendMessage(msg.chat.id, `Failed to fetch tagged expenses for ${context.budget.label}.`);
-  }
+bot.onText(/\/tag(.*)/, async (msg) => {
+  await bot.sendMessage(
+    msg.chat.id,
+    'Tags are no longer stored. Use hashtags as category hints instead, like "grab 12 #transport".'
+  );
 });
 
 // ============================================================
@@ -1413,17 +1453,27 @@ bot.on('message', async (msg) => {
     return;
   }
 
-  const { tags, cleanText: textWithoutTags } = extractTags(msg.text);
-  const { account, cleanText } = extractAccount(textWithoutTags, context);
+  const categoryHint = await extractCategoryHint(msg.text, context);
+  const { account, cleanText } = extractAccount(categoryHint.cleanText, context);
   let expense = parseExpenseText(cleanText, context.budgetKey);
+
+  if (categoryHint.category) {
+    expense.category = categoryHint.category;
+    expense.needsCategory = false;
+  } else if (categoryHint.ambiguous) {
+    expense.category = null;
+    expense.needsCategory = true;
+  }
+
   expense = await normalizeExpenseCategory(context, expense);
-  expense.tags = tags;
 
   if (expense.needsAmount && expense.needsCategory) {
     pendingExpenses.set(key, { ...expense, account, step: 'category' });
     await bot.sendMessage(
       context.chatId,
-      `I couldn't match a category for "${expense.description}". Pick one from ${context.budget.label}:`,
+      categoryHint.ambiguous
+        ? describeCategoryHintProblem(categoryHint, context.budget.label)
+        : `I couldn't match a category for "${expense.description}". Pick one from ${context.budget.label}:`,
       await categoryKeyboard(context)
     );
     return;
@@ -1439,7 +1489,9 @@ bot.on('message', async (msg) => {
     pendingExpenses.set(key, { ...expense, account, step: 'category' });
     await bot.sendMessage(
       context.chatId,
-      `$${expense.amount.toFixed(2)} for "${expense.description}" (${account.label}). What category?`,
+      categoryHint.ambiguous
+        ? `$${expense.amount.toFixed(2)} for "${expense.description}" (${account.label}). ${describeCategoryHintProblem(categoryHint, context.budget.label)}`
+        : `$${expense.amount.toFixed(2)} for "${expense.description}" (${account.label}). What category?`,
       await categoryKeyboard(context)
     );
     return;
