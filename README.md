@@ -210,6 +210,7 @@ Hashtags are not stored as tags. They are stripped from the description and used
 | `/spend food` | Drill into one category |
 | `/fixed` | Recurring costs |
 | `/undo` | Delete last entry |
+| `/cancel` | Discard the current conversation and start a new request |
 | `/accounts` | Your accounts + keywords |
 | `/categories` | All categories |
 | `/help` | Quick reference |

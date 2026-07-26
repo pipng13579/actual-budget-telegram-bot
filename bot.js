@@ -579,10 +579,62 @@ async function getSpendingByCategory(budgetKey, startDate, endDate, accountIds) 
 // ============================================================
 
 validateConfig();
-const bot = new TelegramBot(TELEGRAM_BOT_TOKEN, { polling: true });
+const bot = new TelegramBot(TELEGRAM_BOT_TOKEN, {
+  polling: {
+    autoStart: false,
+    interval: 1000,
+    params: { timeout: 30 },
+  },
+});
 
 const pendingExpenses = new Map();
 const lastExpense = new Map();
+
+function safeBotHandler(label, handler) {
+  return (...args) => {
+    return Promise.resolve()
+      .then(() => handler(...args))
+      .catch(async (err) => {
+        console.error(`${label} handler error:`, err);
+
+        const msg = args[0];
+        if (!msg?.chat?.id) return;
+
+        try {
+          await bot.sendMessage(
+            msg.chat.id,
+            'Something went wrong while handling that request. You can use /cancel to reset the current conversation.'
+          );
+        } catch (sendErr) {
+          console.error(`Failed to send ${label} error reply:`, sendErr.message);
+        }
+      });
+  };
+}
+
+function onText(pattern, label, handler) {
+  bot.onText(pattern, safeBotHandler(label, handler));
+}
+
+function onMessage(event, label, handler) {
+  bot.on(event, safeBotHandler(label, handler));
+}
+
+bot.on('polling_error', (err) => {
+  console.error('Telegram polling error:', err.message);
+});
+
+// node-telegram-bot-api may emit this if it cannot recover an update offset.
+// Registering a listener prevents EventEmitter's default process crash.
+bot.on('error', (err) => {
+  console.error('Telegram bot error:', err.message);
+});
+
+// Event callbacks and third-party background tasks should be wrapped above,
+// but keep one final rejection boundary so Node 22 does not terminate the bot.
+process.on('unhandledRejection', (reason) => {
+  console.error('Unhandled promise rejection:', reason);
+});
 
 async function sendContextError(msg, contextOrError) {
   if (contextOrError?.error) {
@@ -905,7 +957,7 @@ async function handleNaturalQuery(context, text) {
 // COMMANDS
 // ============================================================
 
-bot.onText(/\/start/, async (msg) => {
+onText(/\/start/, '/start', async (msg) => {
   const context = await getContextOrReply(msg);
   if (!context) return;
 
@@ -922,11 +974,11 @@ bot.onText(/\/start/, async (msg) => {
       `Use a hashtag as a category hint:\n` +
       `"grab 12 #transport"\n\n` +
       `Private chats update personal budget files. The configured family group updates the shared family file.\n\n` +
-      `Commands: /today, /month, /spend, /fixed, /undo, /accounts, /categories, /help`
+      `Commands: /today, /month, /spend, /fixed, /undo, /cancel, /accounts, /categories, /help`
   );
 });
 
-bot.onText(/\/categories/, async (msg) => {
+onText(/\/categories/, '/categories', async (msg) => {
   const context = await getContextOrReply(msg);
   if (!context) return;
 
@@ -934,7 +986,7 @@ bot.onText(/\/categories/, async (msg) => {
   await bot.sendMessage(msg.chat.id, `${context.budget.label} categories:\n\n${categories.map((c) => '- ' + c).join('\n')}`);
 });
 
-bot.onText(/\/accounts/, async (msg) => {
+onText(/\/accounts/, '/accounts', async (msg) => {
   const context = await getContextOrReply(msg);
   if (!context) return;
 
@@ -951,7 +1003,21 @@ bot.onText(/\/accounts/, async (msg) => {
   );
 });
 
-bot.onText(/\/help/, async (msg) => {
+onText(/^\/cancel(?:@\w+)?(?:\s.*)?$/i, '/cancel', async (msg) => {
+  const context = await getContextOrReply(msg);
+  if (!context) return;
+
+  const hadPendingConversation = pendingExpenses.delete(pendingKey(context));
+  await bot.sendMessage(
+    context.chatId,
+    hadPendingConversation
+      ? 'Cancelled the current conversation. You can send a new request now.'
+      : 'There is no active conversation. You can send a new request now.',
+    removeKeyboard()
+  );
+});
+
+onText(/\/help/, '/help', async (msg) => {
   const context = await getContextOrReply(msg);
   if (!context) return;
 
@@ -965,11 +1031,12 @@ bot.onText(/\/help/, async (msg) => {
       `"grab 12 #transport"\n` +
       `"transfer 500 savings credit"\n\n` +
       `Hashtags are category hints matched against this budget file's Actual categories.\n\n` +
-      `Ask questions like "what did I spend today?" or "how much did we spend this week?"`
+      `Ask questions like "what did I spend today?" or "how much did we spend this week?"\n\n` +
+      `Use /cancel at any time to discard the current conversation and start a new request.`
   );
 });
 
-bot.onText(/\/today/, async (msg) => {
+onText(/\/today/, '/today', async (msg) => {
   const context = await getContextOrReply(msg);
   if (!context) return;
 
@@ -1006,7 +1073,7 @@ bot.onText(/\/today/, async (msg) => {
   }
 });
 
-bot.onText(/\/month/, async (msg) => {
+onText(/\/month/, '/month', async (msg) => {
   const context = await getContextOrReply(msg);
   if (!context) return;
 
@@ -1036,7 +1103,7 @@ bot.onText(/\/month/, async (msg) => {
   }
 });
 
-bot.onText(/\/spend(.*)/, async (msg, match) => {
+onText(/\/spend(.*)/, '/spend', async (msg, match) => {
   const context = await getContextOrReply(msg);
   if (!context) return;
 
@@ -1109,7 +1176,7 @@ bot.onText(/\/spend(.*)/, async (msg, match) => {
 
 const FIXED_CATEGORIES = ['Rent', 'Utilities', 'Insurance'];
 
-bot.onText(/\/fixed/, async (msg) => {
+onText(/\/fixed/, '/fixed', async (msg) => {
   const context = await getContextOrReply(msg);
   if (!context) return;
 
@@ -1136,7 +1203,7 @@ bot.onText(/\/fixed/, async (msg) => {
   }
 });
 
-bot.onText(/\/undo/, async (msg) => {
+onText(/\/undo/, '/undo', async (msg) => {
   const context = await getContextOrReply(msg);
   if (!context) return;
 
@@ -1165,7 +1232,7 @@ bot.onText(/\/undo/, async (msg) => {
   }
 });
 
-bot.onText(/\/tag(.*)/, async (msg) => {
+onText(/\/tag(.*)/, '/tag', async (msg) => {
   await bot.sendMessage(
     msg.chat.id,
     'Tags are no longer stored. Use hashtags as category hints instead, like "grab 12 #transport".'
@@ -1289,7 +1356,7 @@ function startDailyNudge() {
 // PHOTO HANDLER
 // ============================================================
 
-bot.on('photo', async (msg) => {
+onMessage('photo', 'photo', async (msg) => {
   const context = await getContextOrReply(msg);
   if (!context) return;
 
@@ -1343,7 +1410,7 @@ bot.on('photo', async (msg) => {
 // TEXT MESSAGE HANDLER
 // ============================================================
 
-bot.on('message', async (msg) => {
+onMessage('message', 'message', async (msg) => {
   if (!msg.text || msg.text.startsWith('/')) return;
   if (msg.photo) return;
 
@@ -1547,7 +1614,7 @@ async function shutdown(signal) {
   console.log(`Received ${signal}; shutting down...`);
 
   try {
-    await bot.stopPolling();
+    await bot.stopPolling({ cancel: true, reason: `${signal} shutdown` });
   } catch (err) {
     console.error('Failed to stop Telegram polling cleanly:', err.message);
   }
@@ -1590,9 +1657,16 @@ async function main() {
 
   startWeeklySummary();
   startDailyNudge();
+  bot.startPolling({ restart: false }).catch((err) => {
+    console.error('Failed to start Telegram polling:', err);
+  });
 
   console.log('---');
   console.log('Bot is running. Private chats use personal budgets; the configured group uses the family budget.');
 }
 
-main().catch(console.error);
+main().catch(async (err) => {
+  console.error('Bot startup failed:', err);
+  await shutdown('startup failure');
+  process.exit(1);
+});
