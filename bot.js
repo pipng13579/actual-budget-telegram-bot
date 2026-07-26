@@ -9,6 +9,7 @@ import {
 } from './parser.js';
 import { initVision, parseReceipt } from './receipt.js';
 import { mkdirSync } from 'fs';
+import { join } from 'path';
 import https from 'https';
 import http from 'http';
 
@@ -30,6 +31,8 @@ const {
 } = process.env;
 
 const ACTUAL_DATA_DIR = process.env.ACTUAL_DATA_DIR || '/tmp/actual-data';
+const ACTUAL_BUDGET_DATA_DIR =
+  process.env.ACTUAL_BUDGET_DATA_DIR || join(ACTUAL_DATA_DIR, 'budgets');
 
 function compactObject(obj) {
   return Object.fromEntries(Object.entries(obj).filter(([, value]) => value !== undefined && value !== ''));
@@ -281,9 +284,9 @@ async function ensureActualClient() {
     throw new Error('ACTUAL_SERVER_URL and ACTUAL_SERVER_PASSWORD are required for syncing.');
   }
 
-  mkdirSync(ACTUAL_DATA_DIR, { recursive: true });
+  mkdirSync(ACTUAL_BUDGET_DATA_DIR, { recursive: true });
   await actualApi.init({
-    dataDir: ACTUAL_DATA_DIR,
+    dataDir: ACTUAL_BUDGET_DATA_DIR,
     serverURL: ACTUAL_SERVER_URL,
     password: ACTUAL_SERVER_PASSWORD,
   });
@@ -314,20 +317,41 @@ async function switchToBudget(budgetKey) {
   if (activeBudgetKey === budgetKey && state.ready) return state;
 
   const downloadOpts = budget.encryptionPassword ? { password: budget.encryptionPassword } : undefined;
-  await actualApi.downloadBudget(budget.syncId, downloadOpts);
-  await refreshBudgetCategories(state);
+  // downloadBudget closes the currently open database before it attempts to
+  // find and load the requested budget. Invalidate our state first so a failed
+  // switch can never leave us pointing at Actual's now-closed database.
+  activeBudgetKey = null;
+  state.ready = false;
 
-  state.ready = true;
-  state.error = null;
-  activeBudgetKey = budgetKey;
-  return state;
+  try {
+    await actualApi.downloadBudget(budget.syncId, downloadOpts);
+    await refreshBudgetCategories(state);
+
+    state.ready = true;
+    state.error = null;
+    activeBudgetKey = budgetKey;
+    return state;
+  } catch (err) {
+    state.error = err.message;
+    throw err;
+  }
 }
 
 async function withBudget(budgetKey, operation) {
   const run = async () => {
     await ensureActualClient();
-    const state = await switchToBudget(budgetKey);
-    return operation(state);
+    try {
+      const state = await switchToBudget(budgetKey);
+      return await operation(state);
+    } catch (err) {
+      // Force the next queued operation to verify and reopen its budget. This
+      // also recovers from API errors that close Actual's process-global DB.
+      if (activeBudgetKey === budgetKey) {
+        activeBudgetKey = null;
+        getBudgetState(budgetKey).ready = false;
+      }
+      throw err;
+    }
   };
 
   const result = actualQueue.then(run, run);
@@ -1514,6 +1538,42 @@ bot.on('message', async (msg) => {
 // ============================================================
 // STARTUP
 // ============================================================
+
+let shutdownStarted = false;
+
+async function shutdown(signal) {
+  if (shutdownStarted) return;
+  shutdownStarted = true;
+  console.log(`Received ${signal}; shutting down...`);
+
+  try {
+    await bot.stopPolling();
+  } catch (err) {
+    console.error('Failed to stop Telegram polling cleanly:', err.message);
+  }
+
+  // Let the current Actual operation finish before closing its process-global
+  // database. Actual recommends shutdown() so cached files are left clean.
+  await actualQueue.catch(() => {});
+  if (actualInitialized) {
+    try {
+      await actualApi.shutdown();
+    } catch (err) {
+      console.error('Failed to close Actual Budget cleanly:', err.message);
+    }
+  }
+}
+
+for (const signal of ['SIGINT', 'SIGTERM']) {
+  process.once(signal, () => {
+    shutdown(signal)
+      .then(() => process.exit(0))
+      .catch((err) => {
+        console.error('Shutdown failed:', err);
+        process.exit(1);
+      });
+  });
+}
 
 async function main() {
   console.log('Starting Budget Bot...');

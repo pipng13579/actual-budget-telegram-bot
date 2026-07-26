@@ -13,7 +13,7 @@
   ],
   "license": "MIT",
   "dependencies": {
-    "@actual-app/api": "^26.3.0",
+    "@actual-app/api": "26.7.0",
     "@google-cloud/vision": "^4.3.2",
     "node-telegram-bot-api": "^0.66.0",
     "dotenv": "^16.4.5"

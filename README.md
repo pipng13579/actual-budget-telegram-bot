@@ -113,6 +113,11 @@ BUDGET_FAMILY_SYNC_ID=...
 BUDGET_FAMILY_ENCRYPTION_PASSWORD=...
 ```
 
+Downloaded Actual files are cached under `ACTUAL_DATA_DIR/budgets` by default.
+This intentionally keeps Actual's `metadata.json` files separate from the bot's
+learned-keyword JSON files. Set `ACTUAL_BUDGET_DATA_DIR` to override that cache
+location.
+
 In the shared family budget, each user can have a different default account:
 
 ```env
