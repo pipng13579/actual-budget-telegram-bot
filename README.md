@@ -169,7 +169,21 @@ Text format is:
 <date optional> <payee> <amount> <account optional> <notes optional> #<category optional>
 ```
 
-The date can be at the front or back, for example `30/5`, `30/05/26`, `30 May`, `today`, `yesterday`, or `5 days ago`. Anything before the amount becomes the Actual payee. Anything after the amount is interpreted as account keyword, category hashtag, and remaining notes.
+The date can be at the front or back. Supported forms include `30/5`, `30/05/26`, `30 May`, `today`, `yesterday`, and `5 days ago`. Anything before the amount becomes the Actual payee. Anything after the amount is interpreted as an account keyword, category hashtag, and remaining notes. If the account is omitted, the chat/user's configured default account is used.
+
+Examples:
+
+```text
+lunch 12.50
+30/5 lunch 12.50 credit
+lunch 12.50 credit 30 May
+coffee 5.50 yesterday
+groceries 45.30 5 days ago
+Starbucks 6.20 credit team coffee #food
+grab 12 #transport
+```
+
+Amounts may be written as `12`, `12.50`, `$12.50`, or with commas such as `$1,250.00`. Account keywords and category matches come from the budget configured for the current chat.
 
 ### Transfers
 
@@ -210,14 +224,37 @@ Hashtags are not stored as tags. They are stripped from the description and used
 | `/spend food` | Drill into one category |
 | `/fixed` | Recurring costs |
 | `/undo` | Delete last entry |
-| `/cancel` | Discard the current conversation and start a new request |
+| `/reset` | Discard the current conversation and start a new request |
+| `/cancel` | Alias for `/reset` |
+| `/fix $12.50` | Change the pending amount |
+| `/account pip` | Change the pending account |
+| `/category groceries` | Search again and change the pending category |
+| `/comment team lunch` | Change the pending comment/notes |
+| `/date 30/5` | Change the pending date |
 | `/accounts` | Your accounts + keywords |
 | `/categories` | All categories |
 | `/help` | Quick reference |
 
+### Follow-up conversations and corrections
+
+The bot may ask a follow-up question when an expense is missing an amount, category, or account. Reply with the requested value, or use these corrections while the conversation is still pending:
+
+| Function | Syntax | Example |
+|---|---|---|
+| Change amount | `/fix <amount>` | `/fix $12.50` |
+| Change account | `/account <keyword>` | `/account pip` |
+| Change category | `/category <name or #hint>` | `/category groceries` |
+| Change notes | `/comment <text>` | `/comment team lunch` |
+| Change date | `/date <date>` | `/date 30/5` |
+| Start over | `/reset` or `/cancel` | `/reset` |
+
+During a pending conversation, a standalone amount such as `$12.50` changes the amount, and a standalone hashtag such as `#groceries` changes the category. Account and category keyboard choices can be sent as replies. Corrections keep the other expense details and continue the conversation; they do not save the expense until all required fields are complete.
+
 ### Cancel anytime
 
 Say `cancel`, `nevermind`, `nvm`, `forget it`, `stop`, `skip`, `nah`, or `no`.
+
+You can use `/reset` at any point in a multi-step expense conversation. It discards the pending expense and removes the reply keyboard. `/undo` is different: it deletes the most recently saved transaction.
 
 
 ## 🚢 Deployment

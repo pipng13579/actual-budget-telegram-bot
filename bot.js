@@ -3,6 +3,7 @@ import TelegramBot from 'node-telegram-bot-api';
 import * as actualApi from '@actual-app/api';
 import {
   parseExpenseText,
+  parseDateInput,
   BUILTIN_CATEGORIES,
   learnKeyword,
   loadLearnedKeywords,
@@ -603,7 +604,7 @@ function safeBotHandler(label, handler) {
         try {
           await bot.sendMessage(
             msg.chat.id,
-            'Something went wrong while handling that request. You can use /cancel to reset the current conversation.'
+            'Something went wrong while handling that request. You can use /reset to reset the current conversation.'
           );
         } catch (sendErr) {
           console.error(`Failed to send ${label} error reply:`, sendErr.message);
@@ -787,6 +788,180 @@ async function confirmExpense(context, expense, account) {
       `What: ${expense.description}${notesLine}${syncNote}`,
     removeKeyboard()
   );
+}
+
+function getPendingExpense(context) {
+  return pendingExpenses.get(pendingKey(context));
+}
+
+function parseCorrectionAmount(value) {
+  const normalized = String(value || '').trim().replace(/^\$/, '').replace(/,/g, '');
+  if (!/^\d+(?:\.\d{1,2})?$/.test(normalized)) return null;
+
+  const amount = Number(normalized);
+  return Number.isFinite(amount) && amount > 0 && amount < 100000 ? amount : null;
+}
+
+function findAccountKey(input, context) {
+  const text = String(input || '').trim().toLowerCase();
+  return context.accountKeys.find((key) => {
+    const account = context.budget.accounts[key];
+    const label = `${account.label} (${key})`.toLowerCase();
+    return text === key || text === account.label.toLowerCase() || text === label;
+  });
+}
+
+async function promptPendingExpense(context, pending) {
+  if (pending.step === 'category') {
+    const amount = pending.amount ? `$${pending.amount.toFixed(2)} for ` : '';
+    await bot.sendMessage(
+      context.chatId,
+      `${amount}"${pending.description}". What category?`,
+      await categoryKeyboard(context)
+    );
+    return;
+  }
+
+  if (pending.step === 'amount') {
+    await bot.sendMessage(
+      context.chatId,
+      pending.category
+        ? `Category: ${pending.category}. How much was it?`
+        : `How much was "${pending.description}"?`,
+      removeKeyboard()
+    );
+    return;
+  }
+
+  if (pending.step === 'account') {
+    await bot.sendMessage(context.chatId, 'Which account?', accountKeyboard(context));
+  }
+}
+
+async function advancePendingExpense(context, pending) {
+  if (pending.step === 'category') {
+    if (pending.needsAmount) {
+      pending.step = 'amount';
+      await promptPendingExpense(context, pending);
+      return;
+    }
+    if (pending.ocrPreview !== undefined) {
+      pending.step = 'account';
+      await promptPendingExpense(context, pending);
+      return;
+    }
+  }
+
+  if (pending.step === 'amount') {
+    if (pending.needsCategory) {
+      pending.step = 'category';
+      await promptPendingExpense(context, pending);
+      return;
+    }
+    if (pending.ocrPreview !== undefined) {
+      pending.step = 'account';
+      await promptPendingExpense(context, pending);
+      return;
+    }
+  }
+
+  if (pending.step === 'account') {
+    const key = pendingKey(context);
+    pendingExpenses.delete(key);
+    await confirmExpense(context, pending, pending.account);
+    return;
+  }
+
+  if (pending.step === 'category' || pending.step === 'amount') {
+    const key = pendingKey(context);
+    pendingExpenses.delete(key);
+    await confirmExpense(context, pending, pending.account);
+  }
+}
+
+async function applyPendingCorrection(context, type, value) {
+  const key = pendingKey(context);
+  const pending = getPendingExpense(context);
+  if (!pending) {
+    await bot.sendMessage(context.chatId, 'There is no active expense conversation to update.');
+    return;
+  }
+
+  if (type === 'amount') {
+    const amount = parseCorrectionAmount(value);
+    if (!amount) {
+      await bot.sendMessage(context.chatId, 'That does not look like a valid amount. Try /fix $12.50.');
+      return;
+    }
+    pending.amount = amount;
+    pending.needsAmount = false;
+    await bot.sendMessage(context.chatId, `Amount updated to $${amount.toFixed(2)}.`);
+    if (pending.step === 'amount') await advancePendingExpense(context, pending);
+    else await promptPendingExpense(context, pending);
+    return;
+  }
+
+  if (type === 'account') {
+    const accountKey = findAccountKey(value, context);
+    if (!accountKey) {
+      await bot.sendMessage(
+        context.chatId,
+        `I couldn't find that account. Choose one of: ${context.accountKeys.join(', ')}`
+      );
+      return;
+    }
+    pending.accountKey = accountKey;
+    pending.account = context.budget.accounts[accountKey];
+    await bot.sendMessage(context.chatId, `Account updated to ${pending.account.label}.`);
+    if (pending.step === 'account') await advancePendingExpense(context, pending);
+    else await promptPendingExpense(context, pending);
+    return;
+  }
+
+  if (type === 'category') {
+    const categories = await getCategoryNamesForBudget(context.budgetKey);
+    const selected = resolveCategoryName(String(value || '').trim().replace(/^#/, ''), categories);
+    if (!selected) {
+      await bot.sendMessage(
+        context.chatId,
+        `I couldn't find one clear category for "${value}". Try again:`,
+        await categoryKeyboard(context)
+      );
+      return;
+    }
+    pending.category = selected;
+    pending.needsCategory = false;
+    if (pending.description && pending.description !== 'expense') {
+      learnKeyword(context.budgetKey, pending.description, selected);
+    }
+    await bot.sendMessage(context.chatId, `Category updated to ${selected}.`);
+    if (pending.step === 'category') await advancePendingExpense(context, pending);
+    else await promptPendingExpense(context, pending);
+    return;
+  }
+
+  if (type === 'comment') {
+    const comment = String(value || '').trim();
+    if (!comment) {
+      await bot.sendMessage(context.chatId, 'Please include the comment after /comment.');
+      return;
+    }
+    pending.notes = comment;
+    await bot.sendMessage(context.chatId, 'Comment updated.');
+    await promptPendingExpense(context, pending);
+    return;
+  }
+
+  if (type === 'date') {
+    const date = parseDateInput(value);
+    if (!date) {
+      await bot.sendMessage(context.chatId, 'I could not understand that date. Try /date today or /date 30/5.');
+      return;
+    }
+    pending.date = date;
+    await bot.sendMessage(context.chatId, `Date updated to ${date}.`);
+    await promptPendingExpense(context, pending);
+  }
 }
 
 // ============================================================
@@ -974,7 +1149,7 @@ onText(/\/start/, '/start', async (msg) => {
       `Use a hashtag as a category hint:\n` +
       `"grab 12 #transport"\n\n` +
       `Private chats update personal budget files. The configured family group updates the shared family file.\n\n` +
-      `Commands: /today, /month, /spend, /fixed, /undo, /cancel, /accounts, /categories, /help`
+      `Commands: /today, /month, /spend, /fixed, /undo, /reset (/cancel), /fix, /account, /category, /comment, /date, /accounts, /categories, /help`
   );
 });
 
@@ -1017,6 +1192,50 @@ onText(/^\/cancel(?:@\w+)?(?:\s.*)?$/i, '/cancel', async (msg) => {
   );
 });
 
+onText(/^\/reset(?:@\w+)?(?:\s.*)?$/i, '/reset', async (msg) => {
+  const context = await getContextOrReply(msg);
+  if (!context) return;
+
+  const hadPendingConversation = pendingExpenses.delete(pendingKey(context));
+  await bot.sendMessage(
+    context.chatId,
+    hadPendingConversation
+      ? 'Reset complete. You can start a new request now.'
+      : 'There was no active conversation. You can start a new request now.',
+    removeKeyboard()
+  );
+});
+
+onText(/^\/fix(?:@\w+)?(?:\s+(.+))?\s*$/i, '/fix', async (msg, match) => {
+  const context = await getContextOrReply(msg);
+  if (!context) return;
+  await applyPendingCorrection(context, 'amount', match?.[1]);
+});
+
+onText(/^\/account(?:@\w+)?(?:\s+(.+))?\s*$/i, '/account', async (msg, match) => {
+  const context = await getContextOrReply(msg);
+  if (!context) return;
+  await applyPendingCorrection(context, 'account', match?.[1]);
+});
+
+onText(/^\/category(?:@\w+)?(?:\s+(.+))?\s*$/i, '/category', async (msg, match) => {
+  const context = await getContextOrReply(msg);
+  if (!context) return;
+  await applyPendingCorrection(context, 'category', match?.[1]);
+});
+
+onText(/^\/comment(?:@\w+)?(?:\s+(.+))?\s*$/i, '/comment', async (msg, match) => {
+  const context = await getContextOrReply(msg);
+  if (!context) return;
+  await applyPendingCorrection(context, 'comment', match?.[1]);
+});
+
+onText(/^\/date(?:@\w+)?(?:\s+(.+))?\s*$/i, '/date', async (msg, match) => {
+  const context = await getContextOrReply(msg);
+  if (!context) return;
+  await applyPendingCorrection(context, 'date', match?.[1]);
+});
+
 onText(/\/help/, '/help', async (msg) => {
   const context = await getContextOrReply(msg);
   if (!context) return;
@@ -1024,15 +1243,31 @@ onText(/\/help/, '/help', async (msg) => {
   await bot.sendMessage(
     msg.chat.id,
     `This chat updates ${context.budget.label}.\n\n` +
+      `EXPENSE SYNTAX\n` +
+      `<date optional> <payee> <amount> <account optional> <notes optional> #<category optional>\n\n` +
       `Examples:\n` +
-      `"coffee 5.50"\n` +
-      `"uber home 15 credit"\n` +
-      `"30 May Starbucks 6.20 credit team coffee #food"\n` +
-      `"grab 12 #transport"\n` +
-      `"transfer 500 savings credit"\n\n` +
-      `Hashtags are category hints matched against this budget file's Actual categories.\n\n` +
-      `Ask questions like "what did I spend today?" or "how much did we spend this week?"\n\n` +
-      `Use /cancel at any time to discard the current conversation and start a new request.`
+      `lunch 12.50\n` +
+      `30/5 lunch 12.50 credit\n` +
+      `coffee 5.50 yesterday\n` +
+      `Starbucks 6.20 credit team coffee #food\n` +
+      `grab 12 #transport\n\n` +
+      `Dates can be at the front or back: 30/5, 30 May, today, yesterday, or 5 days ago. ` +
+      `No account keyword uses your configured default account. Hashtags are category hints matched against this budget's Actual categories.\n\n` +
+      `TRANSFERS\n` +
+      `transfer <amount> <from account> <to account>\n` +
+      `Example: transfer 500 savings credit\n\n` +
+      `QUESTIONS\n` +
+      `Ask: "what did I spend today?", "how much did we spend this week?", or "how much on food this month?"\n\n` +
+      `COMMANDS\n` +
+      `/today · /month · /spend [category] · /fixed · /undo\n` +
+      `/accounts · /categories · /help\n` +
+      `/reset or /cancel — discard the pending conversation\n\n` +
+      `WHILE I AM ASKING A FOLLOW-UP\n` +
+      `Reply with the amount, category, or account I asked for. You can also use:\n` +
+      `/fix $12.50 · /account pip · /category groceries\n` +
+      `/comment team lunch · /date 30/5\n` +
+      `A standalone amount (such as $12.50) updates the amount, and #groceries updates the category. ` +
+      `Say cancel, nevermind, nvm, forget it, stop, skip, nah, or no to abandon it.`
   );
 });
 
@@ -1428,17 +1663,24 @@ onMessage('message', 'message', async (msg) => {
       return;
     }
 
-    if (pending.step === 'account') {
-      const selectedKey = context.accountKeys.find((accountKey) => {
-        const account = context.budget.accounts[accountKey];
-        const label = `${account.label} (${accountKey})`;
-        const text = msg.text.trim().toLowerCase();
-        return text === label.toLowerCase() || text === accountKey;
-      });
+    const trimmedText = msg.text.trim();
+    if (/^\$?\d+(?:\.\d{1,2})?$/.test(trimmedText.replace(/,/g, ''))) {
+      await applyPendingCorrection(context, 'amount', trimmedText);
+      return;
+    }
 
-      if (selectedKey) pending.account = context.budget.accounts[selectedKey];
-      pendingExpenses.delete(key);
-      await confirmExpense(context, pending, pending.account);
+    if (/^#\S+$/.test(trimmedText)) {
+      await applyPendingCorrection(context, 'category', trimmedText);
+      return;
+    }
+
+    if (pending.step === 'account') {
+      const selectedKey = findAccountKey(msg.text, context);
+      if (!selectedKey) {
+        await bot.sendMessage(context.chatId, 'Please choose an account from the list.', accountKeyboard(context));
+        return;
+      }
+      await applyPendingCorrection(context, 'account', msg.text);
       return;
     }
 
@@ -1451,55 +1693,12 @@ onMessage('message', 'message', async (msg) => {
 
       pending.amount = amount;
       pending.needsAmount = false;
-
-      if (pending.needsCategory) {
-        pending.step = 'category';
-        await bot.sendMessage(context.chatId, `Got $${amount.toFixed(2)}. What category?`, await categoryKeyboard(context));
-        return;
-      }
-
-      if (pending.ocrPreview !== undefined) {
-        pending.step = 'account';
-        await bot.sendMessage(context.chatId, 'Which account?', accountKeyboard(context));
-        return;
-      }
-
-      pendingExpenses.delete(key);
-      await confirmExpense(context, pending, pending.account);
+      await advancePendingExpense(context, pending);
       return;
     }
 
     if (pending.step === 'category') {
-      const categories = await getCategoryNamesForBudget(context.budgetKey);
-      const selected = resolveCategoryName(msg.text.trim(), categories);
-
-      if (!selected) {
-        await bot.sendMessage(context.chatId, 'Pick a category from the list:', await categoryKeyboard(context));
-        return;
-      }
-
-      pending.category = selected;
-      pending.needsCategory = false;
-
-      if (pending.description && pending.description !== 'expense') {
-        learnKeyword(context.budgetKey, pending.description, selected);
-        console.log(`Learned for ${context.budget.label}: "${pending.description}" -> ${selected}`);
-      }
-
-      if (pending.needsAmount) {
-        pending.step = 'amount';
-        await bot.sendMessage(context.chatId, `Category: ${selected}. How much was it?`, removeKeyboard());
-        return;
-      }
-
-      if (pending.ocrPreview !== undefined) {
-        pending.step = 'account';
-        await bot.sendMessage(context.chatId, 'Which account?', accountKeyboard(context));
-        return;
-      }
-
-      pendingExpenses.delete(key);
-      await confirmExpense(context, pending, pending.account);
+      await applyPendingCorrection(context, 'category', msg.text.trim());
       return;
     }
   }

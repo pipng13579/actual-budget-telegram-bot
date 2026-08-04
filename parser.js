@@ -308,6 +308,14 @@ function extractDate(text) {
   return { date: null, text: text.trim() };
 }
 
+// Parse a date supplied as a standalone correction, such as "today" or
+// "30/5". Requiring the whole input to be a date prevents accidental partial
+// matches (for example, accepting "30/5 please").
+export function parseDateInput(text) {
+  const result = extractDate(String(text || '').trim());
+  return result.date && !result.text ? result.date : null;
+}
+
 // ------------------------------------------------------------
 // AMOUNT EXTRACTION
 // Finds numbers in the message. Handles formats like:
