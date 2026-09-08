@@ -285,6 +285,27 @@ docker run -d --name budget-bot --restart unless-stopped \
 
 Run the Docker container on any always-on machine (NAS, Raspberry Pi, old laptop).
 
+### Telegram 429 / "Too Many Requests"
+
+`retry after 452` means Telegram requires a 452-second (7 minute 32 second)
+cooldown. The bot now waits that delay plus one second before retrying polling
+or a rejected message. Outgoing messages are queued and paced: at least 1.1
+seconds apart per private chat and 3.1 seconds per group. Message delivery retries
+do not rerun expense imports. After three retries a send still failing is reported
+in the logs; the queue keeps the cooldown before attempting the next message.
+
+Logs identify `getUpdates` (polling) versus `sendMessage` (outgoing replies).
+Previously polling retried every second even during a Telegram cooldown, and
+outgoing messages were neither paced nor retried. The error alone does not
+identify what initially triggered Telegram's limit.
+
+After updating, rebuild and recreate the bot service in your Compose app so it
+uses the new image. Keep only one running instance for this bot token, including
+any old deployments on other hosts. Repeated restarts do not clear Telegram's
+cooldown. Queued replies are held in memory and are lost on restart.
+
+See [Telegram's rate-limit guidance](https://core.telegram.org/bots/faq#my-bot-is-hitting-limits-how-do-i-avoid-this).
+
 
 ## 🔔 Automated messages
 

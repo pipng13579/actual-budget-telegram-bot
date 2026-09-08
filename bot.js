@@ -1,5 +1,6 @@
 import 'dotenv/config';
 import TelegramBot from 'node-telegram-bot-api';
+import { installTelegramRateLimits, retryAfterSeconds } from './telegram-rate-limit.js';
 import * as actualApi from '@actual-app/api';
 import {
   parseExpenseText,
@@ -589,6 +590,7 @@ const bot = new TelegramBot(TELEGRAM_BOT_TOKEN, {
 });
 
 const pendingExpenses = new Map();
+installTelegramRateLimits(bot);
 const lastExpense = new Map();
 
 function safeBotHandler(label, handler) {
@@ -596,7 +598,8 @@ function safeBotHandler(label, handler) {
     return Promise.resolve()
       .then(() => handler(...args))
       .catch(async (err) => {
-        console.error(`${label} handler error:`, err);
+        console.error(`${label} handler error:`, err.message);
+        if (retryAfterSeconds(err) !== null) return;
 
         const msg = args[0];
         if (!msg?.chat?.id) return;
