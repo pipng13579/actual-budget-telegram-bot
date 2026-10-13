@@ -188,6 +188,36 @@ routine logs. References/IDs themselves should still be treated as private metad
 
 ## Tests and synthetic post-deployment check
 
+### Actual 26.7.0 scheduled-transaction close race
+
+The reported `Cannot read properties of null (reading 'prepare')` stack in
+`advanceSchedulesService` is reproducible on Node 22.23.3 with the unmodified
+26.7.0 API and two isolated synthetic budgets, with Docker networking disabled.
+Actual's sync listener starts a background schedule mutator without awaiting it.
+Both switching budgets and shutdown can close SQLite while that mutator still
+uses it. The bot's own serialized queue cannot track this internal background work.
+
+`scripts/patch-actual-api.js` applies a narrow compatibility patch during `npm ci`
+or `npm install`. It tracks the pending schedule task (including preference writes),
+waits for it before closing, and prevents new schedule runs during close. Concurrent
+sync events share the in-progress run. Schedules remain enabled; the daily success
+marker is saved only after the run succeeds. A failure is logged without ledger
+details, and a close awaiting that failed run rejects while keeping the database
+open. No process-wide unhandled-rejection suppression or fixed sleep is used.
+
+The patch checks the exact API version and bundle SHA-256, including on repeated
+installation. An unexpected version or modified bundle fails installation so an
+upgrade requires explicit review of the patch. Do not use `--ignore-scripts` for
+installation. Docker copies the patch before `npm ci --omit=dev`, so **rebuild and
+redeploy the image** to apply this fix; restarting an old image is insufficient.
+No API version, budget data, or schedule configuration is changed by installation.
+
+`schedule.integration.test.js` exercises the installed patched API in child
+processes: a real offline sync event starts a due scheduled transaction immediately
+before switching or shutdown. Reopening confirms exactly one transaction in the
+source budget and none in the destination. These are synthetic local lifecycle
+tests, not remote server verification.
+
 ```sh
 npm ci
 npm test

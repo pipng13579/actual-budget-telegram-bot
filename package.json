@@ -5,6 +5,7 @@
   "main": "bot.js",
   "type": "module",
   "scripts": {
+    "postinstall": "node scripts/patch-actual-api.js",
     "start": "node bot.js",
     "test": "node --test",
     "diagnose": "node diagnostics.js"

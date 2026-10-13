@@ -3,6 +3,7 @@ FROM node:22-slim
 WORKDIR /app
 
 COPY package.json package-lock.json ./
+COPY scripts/patch-actual-api.js ./scripts/
 RUN npm ci --omit=dev
 
 COPY bot.js parser.js receipt.js telegram-rate-limit.js dates.js conversations.js submission-journal.js submissions.js diagnostics.js api-logging.js ./
