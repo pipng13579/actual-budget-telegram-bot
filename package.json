@@ -6,7 +6,8 @@
   "type": "module",
   "scripts": {
     "start": "node bot.js",
-    "test": "node --test"
+    "test": "node --test",
+    "diagnose": "node diagnostics.js"
   },
   "keywords": [
     "actual-budget", "telegram-bot", "expense-tracker", "budget",

@@ -6,8 +6,14 @@ primary_region = 'iad'
 
 [build]
 
+# Create this persistent volume in the chosen region before deploying.
+# Keep exactly one machine; multiple bot writers/shared caches are unsupported.
+[[mounts]]
+  source = 'actual_bot_data'
+  destination = '/data'
+
 [processes]
-  app = "sh -c 'echo \"$GCP_KEY_BASE64\" | base64 -d > /app/gcp-key.json && export GOOGLE_APPLICATION_CREDENTIALS=/app/gcp-key.json && node bot.js'"
+  app = "sh -c 'if [ -n \"$GCP_KEY_BASE64\" ]; then umask 077; printf %s \"$GCP_KEY_BASE64\" | base64 -d > /app/gcp-key.json || exit 1; export GOOGLE_APPLICATION_CREDENTIALS=/app/gcp-key.json; fi; exec node bot.js'"
 
 [[vm]]
   size = 'shared-cpu-1x'

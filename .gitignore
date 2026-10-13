@@ -5,3 +5,7 @@ learned-keywords.json
 bot.log
 /tmp/
 .DS_Store
+bot-data/
+submissions.json*
+writer.lock*
+telegram-writer.lock*

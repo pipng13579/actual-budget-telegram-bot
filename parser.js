@@ -9,6 +9,7 @@
 // auto-categorizes without leaking into other budget files.
 // ============================================================
 
+import './dates.js';
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs';
 import { join } from 'path';
 
@@ -287,6 +288,7 @@ function extractDate(text) {
           text: text.slice(front[0].length).replace(/\s+/g, ' ').trim(),
         };
       }
+      return { date: null, invalidDate: true, text: text.trim() };
     }
   }
 
@@ -302,6 +304,7 @@ function extractDate(text) {
           text: text.slice(0, back.index).replace(/\s+/g, ' ').trim(),
         };
       }
+      return { date: null, invalidDate: true, text: text.trim() };
     }
   }
 
@@ -429,6 +432,7 @@ export function parseExpenseText(text, budgetKey = 'default') {
   return {
     amount,
     date: dateResult.date,
+    invalidDate: !!dateResult.invalidDate,
     category,
     description,
     trailingText: afterAmount.replace(/\s+/g, ' ').trim(),

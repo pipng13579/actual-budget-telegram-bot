@@ -118,6 +118,12 @@ This intentionally keeps Actual's `metadata.json` files separate from the bot's
 learned-keyword JSON files. Set `ACTUAL_BUDGET_DATA_DIR` to override that cache
 location.
 
+Set `ACTUAL_DATA_DIR` to persistent storage (for example `/data`) and
+`BOT_DATA_DIR=/data/bot-data`. The bot refuses to start without an explicitly
+configured journal location. Preserve both the journal and Actual cache across
+upgrades. See [transaction integrity and recovery](TRANSACTION-INTEGRITY.md) for
+storage permissions, diagnostics, compatibility decisions, and incident recovery.
+
 In the shared family budget, each user can have a different default account:
 
 ```env
@@ -160,7 +166,7 @@ Starbucks 6.20 credit team coffee #food -> Payee, amount, account, notes, catego
 uber home 15                   -> Transportation, default account
 groceries 67.30 joint          -> Groceries, Joint Account
 grab 12 #transport             -> matches Transport/Transportation in this budget
-[receipt photo]                -> OCR reads total, asks which account
+[receipt photo]                -> OCR reads total, submits using the configured default account
 ```
 
 Text format is:
@@ -254,7 +260,12 @@ During a pending conversation, a standalone amount such as `$12.50` changes the 
 
 Say `cancel`, `nevermind`, `nvm`, `forget it`, `stop`, `skip`, `nah`, or `no`.
 
-You can use `/reset` at any point in a multi-step expense conversation. It discards the pending expense and removes the reply keyboard. `/undo` is different: it deletes the most recently saved transaction.
+You can use `/reset` during an unfinished expense conversation. It discards that
+conversation and removes the reply keyboard. Once submission has started, the bot
+will explicitly say cancellation cannot guarantee reversal. `/undo` only deletes
+the exact last bot-created expense in your chat, after checking its provenance
+and that it has not been changed or reconciled elsewhere. Provenance survives
+restarts; undo details expire after 90 days.
 
 
 ## 🚢 Deployment
@@ -267,6 +278,7 @@ The bot needs to run 24/7 to receive messages.
 fly launch
 fly secrets set TELEGRAM_BOT_TOKEN=xxx ACTUAL_SERVER_URL=xxx ...
 fly secrets set GCP_KEY_BASE64="$(cat gcp-key.json | base64 | tr -d '\n')"
+fly volumes create actual_bot_data --region <your-region> --size 1
 fly deploy
 fly scale count 1
 ```
@@ -277,6 +289,7 @@ fly scale count 1
 docker build -t budget-bot .
 docker run -d --name budget-bot --restart unless-stopped \
   --env-file .env \
+  -v budget-bot-data:/data \
   -v $(pwd)/gcp-key.json:/app/gcp-key.json:ro \
   budget-bot
 ```
@@ -291,7 +304,7 @@ Run the Docker container on any always-on machine (NAS, Raspberry Pi, old laptop
 cooldown. The bot now waits that delay plus one second before retrying polling
 or a rejected message. Outgoing messages are queued and paced: at least 1.1
 seconds apart per private chat and 3.1 seconds per group. Message delivery retries
-do not rerun expense imports. After three retries a send still failing is reported
+do not rerun expense writes. After three retries a send still failing is reported
 in the logs; the queue keeps the cooldown before attempting the next message.
 
 Logs identify `getUpdates` (polling) versus `sendMessage` (outgoing replies).

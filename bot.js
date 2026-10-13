@@ -1,7 +1,13 @@
 import 'dotenv/config';
+import { localDate } from './dates.js';
+import { pathToFileURL } from 'node:url';
+import { SubmissionJournal, acquireLock } from './submission-journal.js';
+import { Conversations, ConversationMap, isCancellation } from './conversations.js';
+import { createSubmissionService, submissionId, configIdentity, outcomeText, safeCode } from './submissions.js';
+import { redactedApi, installApiLogRedaction } from './api-logging.js';
 import TelegramBot from 'node-telegram-bot-api';
 import { installTelegramRateLimits, retryAfterSeconds } from './telegram-rate-limit.js';
-import * as actualApi from '@actual-app/api';
+import * as defaultActualApi from '@actual-app/api';
 import {
   parseExpenseText,
   parseDateInput,
@@ -9,11 +15,21 @@ import {
   learnKeyword,
   loadLearnedKeywords,
 } from './parser.js';
-import { initVision, parseReceipt } from './receipt.js';
+import { initVision, parseReceipt as defaultParseReceipt } from './receipt.js';
 import { mkdirSync } from 'fs';
 import { join } from 'path';
 import https from 'https';
 import http from 'http';
+
+// Importing this module starts no polling, timers, journal or Actual client.
+export function createBotRuntime({ bot: injectedBot, actualApi = redactedApi(defaultActualApi),
+  journal: injectedJournal, parseReceipt = defaultParseReceipt, downloadReceipt,
+  rateLimitOptions = {}, validateConfiguration = true } = {}) {
+const conversations = new Conversations();
+let journal = injectedJournal;
+let submissions;
+let releaseCache;
+const timers = [];
 
 // ============================================================
 // CONFIG
@@ -167,7 +183,7 @@ function validateConfig() {
 
   for (const budget of Object.values(BUDGETS)) {
     if (!budget.syncId) {
-      console.warn(`${budget.label} has no sync ID; it will run in dry-run mode.`);
+      console.warn(`${budget.key} has no sync ID; submissions will fail explicitly.`);
     }
 
     if (Object.keys(budget.accounts).length === 0) {
@@ -232,7 +248,7 @@ function resolveBudgetContext(msg) {
     };
   }
 
-  if (!accountKeys.includes(defaultAccountKey)) accountKeys.push(defaultAccountKey);
+  if (!accountKeys.includes(defaultAccountKey)) return { error: 'The default account is outside your configured account access. Ask the operator to correct the mapping.' };
   if (!personalAccountKeys.includes(defaultAccountKey)) personalAccountKeys.push(defaultAccountKey);
 
   return {
@@ -246,14 +262,12 @@ function resolveBudgetContext(msg) {
     defaultAccountKey,
     isFamilyGroup,
     isPrivate,
+    messageId: msg.message_id,
+    messageDate: localDate(msg.date ? new Date(msg.date * 1000) : new Date()),
   };
 }
 
 function pendingKey(context) {
-  return `${context.budgetKey}:${context.chatId}:${context.userId}`;
-}
-
-function lastExpenseKey(context) {
   return `${context.budgetKey}:${context.chatId}:${context.userId}`;
 }
 
@@ -291,6 +305,7 @@ async function ensureActualClient() {
     dataDir: ACTUAL_BUDGET_DATA_DIR,
     serverURL: ACTUAL_SERVER_URL,
     password: ACTUAL_SERVER_PASSWORD,
+    verbose: false,
   });
 
   actualInitialized = true;
@@ -334,13 +349,14 @@ async function switchToBudget(budgetKey) {
     activeBudgetKey = budgetKey;
     return state;
   } catch (err) {
-    state.error = err.message;
+    state.error = safeCode(err);
     throw err;
   }
 }
 
 async function withBudget(budgetKey, operation) {
   const run = async () => {
+    conversations.check();
     await ensureActualClient();
     try {
       const state = await switchToBudget(budgetKey);
@@ -362,30 +378,18 @@ async function withBudget(budgetKey, operation) {
 }
 
 async function initActualBudgets() {
-  try {
-    await ensureActualClient();
-  } catch (err) {
-    console.error('Failed to connect to Actual Budget:', err.message);
-    console.log('Bot will run in dry-run mode for all budget files.');
-    return;
-  }
-
   for (const budget of Object.values(BUDGETS)) {
     if (!budget.syncId) continue;
 
     try {
       await withBudget(budget.key, async (state) => state);
       const state = getBudgetState(budget.key);
-      console.log(
-        `${budget.label} connected. Categories found: ${
-          state.categoryNames.length > 0 ? state.categoryNames.join(', ') : 'none'
-        }`
-      );
+      console.log(JSON.stringify({ stage: 'initialize', route: budget.key, categories: state.categoryNames.length }));
     } catch (err) {
       const state = getBudgetState(budget.key);
       state.ready = false;
-      state.error = err.message;
-      console.error(`Failed to connect ${budget.label}:`, err.message);
+      state.error = safeCode(err);
+      console.error(JSON.stringify({ stage: 'initialize', route: budget.key, code: safeCode(err) }));
     }
   }
 }
@@ -507,49 +511,28 @@ async function normalizeExpenseCategory(context, expense) {
   };
 }
 
+function originFor(context, expense = {}) {
+  return expense.origin || { botId: TELEGRAM_BOT_TOKEN.split(':')[0], chatId: context.chatId,
+    userId: context.userId, budgetKey: context.budgetKey, messageId: context.messageId };
+}
+
+function submissionRequest(context, expense, legs, kind = 'expense') {
+  return { id: submissionId(originFor(context, expense)), contextKey: pendingKey(context),
+    budgetKey: context.budgetKey, budgetLabel: context.budget.label,
+    configIdentity: configIdentity(ACTUAL_SERVER_URL, context.budget),
+    accountLabel: legs.map(l => l.label).join(' → '), date: expense.date || context.messageDate, kind, legs };
+}
+
 async function addToActual(context, expense, account) {
-  try {
-    return await withBudget(context.budgetKey, async (state) => {
-      const categoryId = expense.category ? findCategoryId(state, expense.category) : null;
-      const amount = Math.round(expense.amount * -100); // cents, negative for expense
-      const transactionDate = expense.date || new Date().toISOString().split('T')[0];
-      const userNotes = expense.notes ? ` | Notes: ${expense.notes}` : '';
-      const notes = `Added by ${context.user.name} via Telegram to ${context.budget.label}${userNotes}`;
-
-      await actualApi.importTransactions(account.id, [
-        {
-          date: transactionDate,
-          amount,
-          payee_name: expense.description,
-          category: categoryId,
-          notes,
-        },
-      ]);
-
-      await actualApi.sync();
-
-      const txns = await actualApi.getTransactions(account.id, transactionDate, transactionDate);
-      const match = txns
-        .slice()
-        .reverse()
-        .find((txn) => txn.amount === amount && txn.category === categoryId);
-
-      return {
-        synced: true,
-        budgetKey: context.budgetKey,
-        transactionId: match ? match.id : null,
-        accountId: account.id,
-        accountLabel: account.label,
-        amount: expense.amount,
-        category: expense.category,
-        description: expense.description,
-        date: transactionDate,
-      };
-    });
-  } catch (err) {
-    console.error(`Failed to add transaction to ${context.budget.label}:`, err.message);
-    return null;
+  conversations.check();
+  if (!context.accountKeys.some(k => context.budget.accounts[k]?.id === account?.id)) {
+    throw new Error('INVALID_ACCOUNT');
   }
+  return submissions.submit(submissionRequest(context, expense, [{ account: account.id, label: account.label,
+    amount: Math.round(expense.amount * -100), category: expense.category,
+    description: expense.description,
+    notes: 'Added by ' + context.user.name + ' via Telegram to ' + context.budget.label +
+      (expense.notes ? ' | Notes: ' + expense.notes : '') }]));
 }
 
 async function getSpendingByCategory(budgetKey, startDate, endDate, accountIds) {
@@ -580,8 +563,8 @@ async function getSpendingByCategory(budgetKey, startDate, endDate, accountIds) 
 // TELEGRAM BOT
 // ============================================================
 
-validateConfig();
-const bot = new TelegramBot(TELEGRAM_BOT_TOKEN, {
+if (validateConfiguration) validateConfig();
+const bot = injectedBot || new TelegramBot(TELEGRAM_BOT_TOKEN, {
   polling: {
     autoStart: false,
     interval: 1000,
@@ -589,28 +572,87 @@ const bot = new TelegramBot(TELEGRAM_BOT_TOKEN, {
   },
 });
 
-const pendingExpenses = new Map();
-installTelegramRateLimits(bot);
-const lastExpense = new Map();
+const pendingExpenses = new ConversationMap(conversations);
+installTelegramRateLimits(bot, { ...rateLimitOptions, beforeSend: () => conversations.check() });
+
+function setupSubmissions() {
+  journal ||= new SubmissionJournal(process.env.BOT_DATA_DIR ||
+    (process.env.ACTUAL_DATA_DIR ? join(ACTUAL_DATA_DIR, 'bot-data') : null));
+  submissions ||= createSubmissionService({ api: actualApi, journal, withBudget,
+    identityForBudget: key => configIdentity(ACTUAL_SERVER_URL, BUDGETS[key]),
+    check: () => conversations.check(), commit: () => conversations.commit() });
+}
+if (injectedJournal) setupSubmissions();
+
+const cancelWords = /^(?:\/cancel(?:@\w+)?(?:\s.*)?|\/reset(?:@\w+)?(?:\s.*)?|cancel|nevermind|never mind|forget it|forget|nvm|stop|skip|nah|no)$/i;
+
+async function handleUpdate(label, context, args, handler) {
+  const msg = args[0];
+  const tracked = label === 'photo' || (label === 'message' && msg.text && !msg.text.startsWith('/')) ||
+    ['/fix', '/account', '/category', '/comment', '/date'].includes(label);
+  if (!tracked) return handler(...args);
+  conversations.check();
+  const eventId = submissionId(originFor(context));
+  const prior = journal.event(eventId);
+  if (prior) {
+    const record = journal.get(prior.submissionId);
+    if (record) await bot.sendMessage(context.chatId, outcomeText(await submissions.submit(record)), removeKeyboard());
+    else if (prior.status === 'handling' && !pendingExpenses.has(pendingKey(context))) {
+      await bot.sendMessage(context.chatId, 'Not added: the earlier conversation was interrupted before submission. Start a new expense.');
+    }
+    return;
+  }
+  const origin = pendingExpenses.get(pendingKey(context))?.origin || originFor(context);
+  // A photo always starts its own expense, even if another input was pending.
+  const linkedId = submissionId(label === 'photo' ? originFor(context) : origin);
+  journal.putEvent(eventId, { submissionId: linkedId, status: 'handling' });
+  try { return await handler(...args); }
+  finally { journal.putEvent(eventId, { submissionId: linkedId, status: 'done' }); }
+}
 
 function safeBotHandler(label, handler) {
   return (...args) => {
-    return Promise.resolve()
-      .then(() => handler(...args))
+    const msg = args[0];
+    if (shutdownStarted) return Promise.resolve();
+    const context = msg?.chat ? resolveBudgetContext(msg) : null;
+    let operation;
+    if (context && !context.error && cancelWords.test(msg.text?.trim() || '')) {
+      // The generic message event receives slash commands too, exactly once.
+      try {
+        const eventId = submissionId(originFor(context));
+        if (journal.event(eventId)?.cancelled) return Promise.resolve();
+        journal.putEvent(eventId, { cancelled: true, status: 'done' });
+        const committed = conversations.cancel(pendingKey(context));
+        pendingExpenses.delete(pendingKey(context));
+        operation = () => bot.sendMessage(context.chatId, committed
+          ? 'Submission already started; cancellation cannot guarantee reversal. Wait for its result before using /undo.'
+          : 'Cancelled the unfinished conversation. You can send a new expense now.', removeKeyboard());
+      } catch (error) { operation = () => Promise.reject(error); }
+    } else {
+      const work = context && !context.error
+        ? conversations.run(pendingKey(context), () => handleUpdate(label, context, args, handler)) : Promise.resolve().then(() => handler(...args));
+      operation = () => work;
+    }
+    return Promise.resolve().then(operation)
       .catch(async (err) => {
-        console.error(`${label} handler error:`, err.message);
+        if (isCancellation(err)) return;
+        console.error(`${label} handler error:`, safeCode(err));
         if (retryAfterSeconds(err) !== null) return;
 
         const msg = args[0];
         if (!msg?.chat?.id) return;
 
         try {
+          const eventId = context && !context.error ? submissionId(originFor(context)) : null;
+          const event = eventId && journal?.event(eventId);
+          const recorded = eventId && journal?.get(event?.submissionId || event?.undoTarget || eventId);
           await bot.sendMessage(
             msg.chat.id,
-            'Something went wrong while handling that request. You can use /reset to reset the current conversation.'
+            recorded ? outcomeText(recorded) :
+              'Something went wrong before a submission was recorded. You can use /reset to reset the current conversation.'
           );
         } catch (sendErr) {
-          console.error(`Failed to send ${label} error reply:`, sendErr.message);
+          console.error(`Failed to send ${label} error reply:`, safeCode(sendErr));
         }
       });
   };
@@ -625,19 +667,13 @@ function onMessage(event, label, handler) {
 }
 
 bot.on('polling_error', (err) => {
-  console.error('Telegram polling error:', err.message);
+  console.error('Telegram polling error:', safeCode(err));
 });
 
 // node-telegram-bot-api may emit this if it cannot recover an update offset.
 // Registering a listener prevents EventEmitter's default process crash.
 bot.on('error', (err) => {
-  console.error('Telegram bot error:', err.message);
-});
-
-// Event callbacks and third-party background tasks should be wrapped above,
-// but keep one final rejection boundary so Node 22 does not terminate the bot.
-process.on('unhandledRejection', (reason) => {
-  console.error('Unhandled promise rejection:', reason);
+  console.error('Telegram bot error:', safeCode(err));
 });
 
 async function sendContextError(msg, contextOrError) {
@@ -649,6 +685,7 @@ async function sendContextError(msg, contextOrError) {
 }
 
 async function getContextOrReply(msg) {
+  conversations.check();
   const context = resolveBudgetContext(msg);
   if (await sendContextError(msg, context)) return null;
   return context;
@@ -770,27 +807,7 @@ function parseTransfer(text, context) {
 
 async function confirmExpense(context, expense, account) {
   const result = await addToActual(context, expense, account);
-  const synced = result && result.synced;
-  const icon = synced ? 'OK' : 'Draft';
-  const syncNote = synced ? '' : '\n(Not synced to Actual Budget)';
-  const dateLine = expense.date ? `Date: ${expense.date}\n` : '';
-  const notesLine = expense.notes ? `\nNotes: ${expense.notes}` : '';
-
-  if (result?.transactionId) {
-    lastExpense.set(lastExpenseKey(context), result);
-  }
-
-  await bot.sendMessage(
-    context.chatId,
-    `${icon} Logged, ${context.user.name}!\n\n` +
-      `Budget: ${context.budget.label}\n` +
-      dateLine +
-      `Amount: $${expense.amount.toFixed(2)}\n` +
-      `Category: ${expense.category}\n` +
-      `Account: ${account.label}\n` +
-      `What: ${expense.description}${notesLine}${syncNote}`,
-    removeKeyboard()
-  );
+  await bot.sendMessage(context.chatId, outcomeText(result), removeKeyboard());
 }
 
 function getPendingExpense(context) {
@@ -848,21 +865,11 @@ async function advancePendingExpense(context, pending) {
       await promptPendingExpense(context, pending);
       return;
     }
-    if (pending.ocrPreview !== undefined) {
-      pending.step = 'account';
-      await promptPendingExpense(context, pending);
-      return;
-    }
   }
 
   if (pending.step === 'amount') {
     if (pending.needsCategory) {
       pending.step = 'category';
-      await promptPendingExpense(context, pending);
-      return;
-    }
-    if (pending.ocrPreview !== undefined) {
-      pending.step = 'account';
       await promptPendingExpense(context, pending);
       return;
     }
@@ -923,6 +930,7 @@ async function applyPendingCorrection(context, type, value) {
 
   if (type === 'category') {
     const categories = await getCategoryNamesForBudget(context.budgetKey);
+    conversations.check();
     const selected = resolveCategoryName(String(value || '').trim().replace(/^#/, ''), categories);
     if (!selected) {
       await bot.sendMessage(
@@ -974,12 +982,12 @@ async function applyPendingCorrection(context, type, value) {
 function getMonthRanges() {
   const now = new Date();
   const thisMonthStart = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-01`;
-  const today = now.toISOString().split('T')[0];
+  const today = localDate(now);
 
   const lastMonth = new Date(now.getFullYear(), now.getMonth() - 1, 1);
   const lastMonthStart = `${lastMonth.getFullYear()}-${String(lastMonth.getMonth() + 1).padStart(2, '0')}-01`;
   const lastMonthEnd = new Date(now.getFullYear(), now.getMonth(), 0);
-  const lastMonthEndStr = lastMonthEnd.toISOString().split('T')[0];
+  const lastMonthEndStr = localDate(lastMonthEnd);
   const monthNames = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
 
   return {
@@ -995,8 +1003,8 @@ function getWeekRange() {
   monday.setDate(now.getDate() - (day === 0 ? 6 : day - 1));
 
   return {
-    start: monday.toISOString().split('T')[0],
-    end: now.toISOString().split('T')[0],
+    start: localDate(monday),
+    end: localDate(now),
     label: 'this week',
   };
 }
@@ -1030,7 +1038,7 @@ const PERSONAL_WORDS = ['i ', "i've", 'my ', 'me ', 'mine'];
 
 function detectPeriod(text) {
   if (/today|tonight/i.test(text)) {
-    const today = new Date().toISOString().split('T')[0];
+    const today = localDate();
     return { start: today, end: today, label: 'today' };
   }
   if (/this week|past week|last 7/i.test(text)) return getWeekRange();
@@ -1125,7 +1133,7 @@ async function handleNaturalQuery(context, text) {
     );
     return true;
   } catch (err) {
-    console.error(`NLQ error for ${context.budget.label}:`, err.message);
+    console.error(`NLQ error for ${context.budget.label}:`, safeCode(err));
     await bot.sendMessage(context.chatId, `Failed to fetch spending data for ${context.budget.label}.`);
     return true;
   }
@@ -1178,34 +1186,6 @@ onText(/\/accounts/, '/accounts', async (msg) => {
     msg.chat.id,
     `${context.budget.label} accounts for ${context.user.name}:\n\n${lines.join('\n')}\n\n` +
       `Add the keyword at the end of your message to pick an account. No keyword uses your default.`
-  );
-});
-
-onText(/^\/cancel(?:@\w+)?(?:\s.*)?$/i, '/cancel', async (msg) => {
-  const context = await getContextOrReply(msg);
-  if (!context) return;
-
-  const hadPendingConversation = pendingExpenses.delete(pendingKey(context));
-  await bot.sendMessage(
-    context.chatId,
-    hadPendingConversation
-      ? 'Cancelled the current conversation. You can send a new request now.'
-      : 'There is no active conversation. You can send a new request now.',
-    removeKeyboard()
-  );
-});
-
-onText(/^\/reset(?:@\w+)?(?:\s.*)?$/i, '/reset', async (msg) => {
-  const context = await getContextOrReply(msg);
-  if (!context) return;
-
-  const hadPendingConversation = pendingExpenses.delete(pendingKey(context));
-  await bot.sendMessage(
-    context.chatId,
-    hadPendingConversation
-      ? 'Reset complete. You can start a new request now.'
-      : 'There was no active conversation. You can start a new request now.',
-    removeKeyboard()
   );
 });
 
@@ -1279,7 +1259,7 @@ onText(/\/today/, '/today', async (msg) => {
   if (!context) return;
 
   try {
-    const today = new Date().toISOString().split('T')[0];
+    const today = localDate();
     await withBudget(context.budgetKey, async () => {
       const accounts = await actualApi.getAccounts();
       let total = 0;
@@ -1306,7 +1286,7 @@ onText(/\/today/, '/today', async (msg) => {
       }
     });
   } catch (err) {
-    console.error('Error fetching today:', err.message);
+    console.error('Error fetching today:', safeCode(err));
     await bot.sendMessage(msg.chat.id, `Failed to fetch today's expenses for ${context.budget.label}.`);
   }
 });
@@ -1336,7 +1316,7 @@ onText(/\/month/, '/month', async (msg) => {
       ).toFixed(2)}`
     );
   } catch (err) {
-    console.error('Error fetching month:', err.message);
+    console.error('Error fetching month:', safeCode(err));
     await bot.sendMessage(msg.chat.id, `Failed to fetch this month's expenses for ${context.budget.label}.`);
   }
 });
@@ -1407,7 +1387,7 @@ onText(/\/spend(.*)/, '/spend', async (msg, match) => {
       ).toFixed(2)}\n\nDrill into any category: /spend grocery`
     );
   } catch (err) {
-    console.error('Error in /spend:', err.message);
+    console.error('Error in /spend:', safeCode(err));
     await bot.sendMessage(msg.chat.id, `Failed to fetch spending data for ${context.budget.label}.`);
   }
 });
@@ -1436,38 +1416,24 @@ onText(/\/fixed/, '/fixed', async (msg) => {
       `${context.budget.label} fixed monthly expenses (${thisMonth.label}):\n\n${lines.join('\n')}\n\nFixed total: $${fixedTotal.toFixed(2)}`
     );
   } catch (err) {
-    console.error('Error in /fixed:', err.message);
+    console.error('Error in /fixed:', safeCode(err));
     await bot.sendMessage(msg.chat.id, `Failed to fetch fixed expenses for ${context.budget.label}.`);
   }
 });
 
-onText(/\/undo/, '/undo', async (msg) => {
+onText(/^\/undo(?:@\w+)?\s*$/i, '/undo', async (msg) => {
   const context = await getContextOrReply(msg);
   if (!context) return;
-
-  const key = lastExpenseKey(context);
-  const last = lastExpense.get(key);
-
-  if (!last?.transactionId) {
-    await bot.sendMessage(msg.chat.id, 'Nothing to undo. I can only undo the last expense you added in this chat this session.');
+  const eventId = submissionId(originFor(context));
+  const previous = journal.event(eventId);
+  const last = previous ? journal.get(previous.undoTarget) : submissions.latest(pendingKey(context));
+  if (!previous) journal.putEvent(eventId, { undoTarget: last?.id || null, status: 'done' });
+  if (!last) {
+    await bot.sendMessage(context.chatId, 'Nothing proven to undo in this chat.');
     return;
   }
-
-  try {
-    await withBudget(last.budgetKey, async () => {
-      await actualApi.deleteTransaction(last.transactionId);
-      await actualApi.sync();
-    });
-
-    lastExpense.delete(key);
-    await bot.sendMessage(
-      msg.chat.id,
-      `Deleted from ${context.budget.label}: $${last.amount.toFixed(2)} | ${last.category} | ${last.description} (${last.accountLabel})`
-    );
-  } catch (err) {
-    console.error('Error in /undo:', err.message);
-    await bot.sendMessage(msg.chat.id, `Failed to delete the last entry from ${context.budget.label}.`);
-  }
+  const result = await submissions.undo(last.id, pendingKey(context));
+  await bot.sendMessage(context.chatId, outcomeText(result));
 });
 
 onText(/\/tag(.*)/, '/tag', async (msg) => {
@@ -1500,9 +1466,9 @@ function startWeeklySummary() {
   const budgetKey = resolveScheduledBudgetKey(WEEKLY_SUMMARY_CHAT_ID, process.env.WEEKLY_SUMMARY_BUDGET_KEY || process.env.WEEKLY_SUMMARY_BUDGET);
   let lastSummaryDate = '';
 
-  setInterval(async () => {
+  timers.push(setInterval(async () => {
     const now = new Date();
-    const todayStr = now.toISOString().split('T')[0];
+    const todayStr = localDate(now);
     if (now.getDay() !== 0 || now.getHours() !== 20) return;
     if (lastSummaryDate === todayStr) return;
 
@@ -1524,9 +1490,9 @@ function startWeeklySummary() {
         ).toFixed(2)}`
       );
     } catch (err) {
-      console.error('Weekly summary error:', err.message);
+      console.error('Weekly summary error:', safeCode(err));
     }
-  }, 60 * 60 * 1000);
+  }, 60 * 60 * 1000));
 
   console.log(`Weekly summary enabled for ${BUDGETS[budgetKey]?.label || budgetKey} (Sunday 8 PM).`);
 }
@@ -1541,9 +1507,9 @@ function startDailyNudge() {
   const budgetKey = resolveScheduledBudgetKey(chatId, process.env.DAILY_NUDGE_BUDGET_KEY || process.env.DAILY_NUDGE_BUDGET);
   let lastNudgeDate = '';
 
-  setInterval(async () => {
+  timers.push(setInterval(async () => {
     const now = new Date();
-    const todayStr = now.toISOString().split('T')[0];
+    const todayStr = localDate(now);
     if (now.getHours() !== 22) return;
     if (lastNudgeDate === todayStr) return;
 
@@ -1583,9 +1549,9 @@ function startDailyNudge() {
         );
       }
     } catch (err) {
-      console.error('Daily nudge error:', err.message);
+      console.error('Daily nudge error:', safeCode(err));
     }
-  }, 15 * 60 * 1000);
+  }, 15 * 60 * 1000));
 
   console.log(`Daily nudge enabled for ${BUDGETS[budgetKey]?.label || budgetKey} (10 PM).`);
 }
@@ -1597,12 +1563,13 @@ function startDailyNudge() {
 onMessage('photo', 'photo', async (msg) => {
   const context = await getContextOrReply(msg);
   if (!context) return;
+  pendingExpenses.delete(pendingKey(context));
 
   await bot.sendMessage(context.chatId, `Reading your receipt for ${context.budget.label}...`);
 
   try {
     const photo = msg.photo[msg.photo.length - 1];
-    const imageBuffer = await downloadFile(photo.file_id);
+    const imageBuffer = await (downloadReceipt || downloadFile)(photo.file_id);
     let result = await parseReceipt(imageBuffer, context.budgetKey);
 
     if (result.error) {
@@ -1610,8 +1577,15 @@ onMessage('photo', 'photo', async (msg) => {
       return;
     }
 
+    conversations.check();
     result = await normalizeExpenseCategory(context, result);
+    result.origin = originFor(context);
+    result.date ||= context.messageDate;
     const defaultAccount = context.budget.accounts[context.defaultAccountKey];
+    if (!result.needsAmount && !result.needsCategory) {
+      await confirmExpense(context, result, defaultAccount);
+      return;
+    }
     pendingExpenses.set(pendingKey(context), {
       ...result,
       step: result.needsAmount ? 'amount' : result.needsCategory ? 'category' : 'account',
@@ -1639,7 +1613,9 @@ onMessage('photo', 'photo', async (msg) => {
       accountKeyboard(context)
     );
   } catch (err) {
-    console.error('Photo handler error:', err.message);
+    if (isCancellation(err)) return;
+    if (journal.get(submissionId(originFor(context)))) throw err;
+    console.error('Photo handler error:', safeCode(err));
     await bot.sendMessage(context.chatId, 'Something went wrong reading that receipt. Try again or type the expense manually.');
   }
 });
@@ -1716,49 +1692,27 @@ onMessage('message', 'message', async (msg) => {
   }
 
   if (transfer) {
-    try {
-      await withBudget(context.budgetKey, async () => {
-        const today = new Date().toISOString().split('T')[0];
-        const amountCents = Math.round(transfer.amount * 100);
-
-        await actualApi.importTransactions(transfer.from.id, [
-          {
-            date: today,
-            amount: -amountCents,
-            payee_name: `Transfer to ${transfer.to.label}`,
-            notes: `Transfer by ${context.user.name} via Telegram to ${context.budget.label}`,
-          },
-        ]);
-
-        await actualApi.importTransactions(transfer.to.id, [
-          {
-            date: today,
-            amount: amountCents,
-            payee_name: `Transfer from ${transfer.from.label}`,
-            notes: `Transfer by ${context.user.name} via Telegram to ${context.budget.label}`,
-          },
-        ]);
-
-        await actualApi.sync();
-      });
-
-      await bot.sendMessage(
-        context.chatId,
-        `Transferred $${transfer.amount.toFixed(2)} in ${context.budget.label}\n\n` +
-          `From: ${transfer.from.label}\n` +
-          `To: ${transfer.to.label}`
-      );
-    } catch (err) {
-      console.error('Transfer error:', err.message);
-      await bot.sendMessage(context.chatId, `Failed to process transfer in ${context.budget.label}.`);
-    }
+    const notes = 'Transfer by ' + context.user.name + ' via Telegram to ' + context.budget.label;
+    const result = await submissions.submit(submissionRequest(context, {}, [
+      { account: transfer.from.id, label: transfer.from.label, amount: -Math.round(transfer.amount * 100),
+        category: null, description: 'Transfer to ' + transfer.to.label, notes },
+      { account: transfer.to.id, label: transfer.to.label, amount: Math.round(transfer.amount * 100),
+        category: null, description: 'Transfer from ' + transfer.from.label, notes },
+    ], 'transfer'));
+    await bot.sendMessage(context.chatId, outcomeText(result));
     return;
   }
 
   const categoryHint = await extractCategoryHint(msg.text, context);
   let expense = parseExpenseText(categoryHint.cleanText, context.budgetKey);
+  if (expense.invalidDate) {
+    await bot.sendMessage(context.chatId, 'Not added: invalid calendar date. Use a valid date at the beginning or end of the expense.');
+    return;
+  }
   const postAmountDetails = extractPostAmountDetails(expense.trailingText || '', context);
   const account = postAmountDetails.account;
+  expense.origin = originFor(context);
+  expense.date ||= context.messageDate;
   expense.notes = postAmountDetails.notes;
 
   if (categoryHint.category) {
@@ -1813,38 +1767,35 @@ let shutdownStarted = false;
 async function shutdown(signal) {
   if (shutdownStarted) return;
   shutdownStarted = true;
+  timers.forEach(clearInterval);
   console.log(`Received ${signal}; shutting down...`);
 
   try {
     await bot.stopPolling({ cancel: true, reason: `${signal} shutdown` });
   } catch (err) {
-    console.error('Failed to stop Telegram polling cleanly:', err.message);
+    console.error('Failed to stop Telegram polling cleanly:', safeCode(err));
   }
 
   // Let the current Actual operation finish before closing its process-global
   // database. Actual recommends shutdown() so cached files are left clean.
+  await conversations.drain();
+  await submissions?.drain();
   await actualQueue.catch(() => {});
   if (actualInitialized) {
     try {
       await actualApi.shutdown();
     } catch (err) {
-      console.error('Failed to close Actual Budget cleanly:', err.message);
+      console.error('Failed to close Actual Budget cleanly:', safeCode(err));
     }
   }
-}
-
-for (const signal of ['SIGINT', 'SIGTERM']) {
-  process.once(signal, () => {
-    shutdown(signal)
-      .then(() => process.exit(0))
-      .catch((err) => {
-        console.error('Shutdown failed:', err);
-        process.exit(1);
-      });
-  });
+  journal?.close();
+  releaseCache?.();
 }
 
 async function main() {
+  setupSubmissions();
+  journal.compact();
+  releaseCache = acquireLock(ACTUAL_BUDGET_DATA_DIR, 'telegram-writer.lock');
   console.log('Starting Budget Bot...');
   console.log('---');
 
@@ -1856,19 +1807,38 @@ async function main() {
   }
 
   await initActualBudgets();
+  await submissions.recover({ startup: true });
+  timers.push(setInterval(() => {
+    submissions.recover().catch(error => console.error('Recovery failed:', safeCode(error)));
+  }, 15_000));
 
   startWeeklySummary();
   startDailyNudge();
   bot.startPolling({ restart: false }).catch((err) => {
-    console.error('Failed to start Telegram polling:', err);
+    console.error('Failed to start Telegram polling:', safeCode(err));
   });
 
   console.log('---');
   console.log('Bot is running. Private chats use personal budgets; the configured group uses the family budget.');
 }
 
-main().catch(async (err) => {
-  console.error('Bot startup failed:', err);
-  await shutdown('startup failure');
-  process.exit(1);
-});
+return { main, shutdown, withBudget, resolveBudgetContext, pendingExpenses,
+  get submissions() { return submissions; }, get journal() { return journal; },
+  budgets: BUDGETS, getMonthRanges, getWeekRange };
+}
+
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  installApiLogRedaction();
+  const runtime = createBotRuntime();
+  for (const signal of ['SIGINT', 'SIGTERM']) {
+    process.once(signal, () => runtime.shutdown(signal).then(() => process.exit(0)).catch(error => {
+      console.error('Shutdown failed:', safeCode(error));
+      process.exit(1);
+    }));
+  }
+  runtime.main().catch(async error => {
+    console.error('Bot startup failed:', safeCode(error));
+    await runtime.shutdown('startup failure');
+    process.exitCode = 1;
+  });
+}

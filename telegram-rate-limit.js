@@ -12,6 +12,7 @@ export function installTelegramRateLimits(bot, {
   now = Date.now,
   wait = sleep,
   warn = console.warn,
+  beforeSend = () => {},
 } = {}) {
   const normalInterval = bot.options.polling.interval;
   const getUpdates = bot.getUpdates.bind(bot);
@@ -38,6 +39,7 @@ export function installTelegramRateLimits(bot, {
       for (let attempt = 0; ; attempt++) {
         const delay = Math.max(nextGlobalSend, nextChatSend.get(key) || 0) - now();
         if (delay > 0) await wait(delay);
+        beforeSend();
         // Telegram allows roughly 1/s per private chat and 20/min per group.
         nextGlobalSend = now() + 50;
         nextChatSend.set(key, now() + (key.startsWith('-') || key.startsWith('@') ? 3100 : 1100));
