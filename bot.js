@@ -531,6 +531,7 @@ async function addToActual(context, expense, account) {
   return submissions.submit(submissionRequest(context, expense, [{ account: account.id, label: account.label,
     amount: Math.round(expense.amount * -100), category: expense.category,
     description: expense.description,
+    userNotes: expense.notes || '',
     notes: 'Added by ' + context.user.name + ' via Telegram to ' + context.budget.label +
       (expense.notes ? ' | Notes: ' + expense.notes : '') }]));
 }

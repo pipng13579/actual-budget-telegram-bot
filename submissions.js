@@ -41,7 +41,15 @@ const fingerprint = row => hash(fields.map(k => row[k] ?? null));
 export function outcomeText(record) {
   const ref = `Reference: ${record.id}`;
   if (record.compacted) return `This submission was already ${record.status === 'undone' ? 'undone' : 'completed'}. Its details have expired; it will not be submitted again. ${ref}`;
-  if (record.status === 'verified') return `${record.kind === 'transfer' ? 'Transfer completed' : 'OK Logged'} in ${record.budgetLabel}.\nAccount: ${record.accountLabel}\nDate: ${record.date}\nAmount: $${(Math.abs(record.legs[0].amount) / 100).toFixed(2)}\n${ref}`;
+  if (record.status === 'verified') {
+    const leg = record.legs[0];
+    const amount = `$${(Math.abs(leg.amount) / 100).toFixed(2)}`;
+    if (record.kind === 'transfer') return `Transfer completed in ${record.budgetLabel}.\nAccount: ${record.accountLabel}\nDate: ${record.date}\nAmount: ${amount}\n${ref}`;
+    // Older journal records only stored user notes inside the bookkeeping text.
+    const notes = leg.userNotes ?? leg.notes?.match(/ \| Notes: ([\s\S]*)$/)?.[1];
+    return `${leg.description} ${amount}\nCategory: ${leg.category}\nAccount: ${record.accountLabel}` +
+      (notes ? `\nNotes: ${notes}` : '');
+  }
   if (record.status === 'undone') return `Deletion synced and verified. ${ref}`;
   if (record.status === 'undo_pending') return `Deletion is not confirmed complete. Do not repeat the expense. ${ref}`;
   if (record.syncAcknowledged) return `Sync completed, but verification failed (${record.errorCode}). Do not resend; ${ref}`;

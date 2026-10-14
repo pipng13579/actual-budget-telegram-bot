@@ -41,7 +41,7 @@ test('complete text immediately submits; duplicate Telegram update and reply tim
   const f = fixture(t);
   await f.dispatch('lunch 7.11', 1);
   assert.equal(f.calls.writes, 1);
-  assert.match(f.messages.at(-1).text, /OK Logged/);
+  assert.equal(f.messages.at(-1).text, 'lunch $7.11\nCategory: Food & Drinks\nAccount: Cash');
   assert.doesNotMatch(f.messages.at(-1).text, /Draft/);
   await f.dispatch('lunch 7.11', 1);
   assert.equal(f.calls.writes, 1);
@@ -77,28 +77,28 @@ test('Telegram reply failure leaves a durable completed submission; replay only 
   const f = fixture(t); const send = f.bot.sendMessage;
   let fail = true;
   f.bot.sendMessage = async (...args) => {
-    if (fail && /OK Logged/.test(args[1])) { fail = false; throw new Error('reply timed out'); }
+    if (fail && args[1].startsWith('lunch $7.11\n')) { fail = false; throw new Error('reply timed out'); }
     return send(...args);
   };
   await f.dispatch('lunch 7.11', 1);
   await f.dispatch('lunch 7.11', 1);
   assert.equal(f.calls.writes, 1);
-  assert.match(f.messages.at(-1).text, /OK Logged/);
+  assert.equal(f.messages.at(-1).text, 'lunch $7.11\nCategory: Food & Drinks\nAccount: Cash');
 });
 
 test('receipt reply failure never tells the user to resend an already written expense', async t => {
   const f = fixture(t, { downloadReceipt: async () => Buffer.from('synthetic'), parseReceipt: async () => ({
-    amount: 7.11, category: 'Food & Drinks', description: 'hawker' }) });
+    amount: 7.11, category: 'Food & Drinks', description: 'Hawker', notes: 'team lunch' }) });
   const send = f.bot.sendMessage; let failed = false;
   f.bot.sendMessage = async (...args) => {
-    if (!failed && /OK Logged/.test(args[1])) { failed = true; throw new Error('reply timeout'); }
+    if (!failed && args[1].startsWith('Hawker $7.11\n')) { failed = true; throw new Error('reply timeout'); }
     return send(...args);
   };
   await f.dispatch(undefined, 1, { photo: [{ file_id: 'synthetic' }], date: Date.parse('2026-10-12T16:00:00Z') / 1000 });
   assert.equal(f.calls.writes, 1);
   assert.equal([...f.rows.values()][0].date, '2026-10-13');
   assert.ok(f.messages.every(m => !/Try again or type/.test(m.text)));
-  assert.match(f.messages.at(-1).text, /OK Logged/);
+  assert.equal(f.messages.at(-1).text, 'Hawker $7.11\nCategory: Food & Drinks\nAccount: Cash\nNotes: team lunch');
 });
 
 for (const command of ['/cancel', '/reset', 'cancel', 'nvm']) {
@@ -153,7 +153,7 @@ test('cancel after commit boundary explicitly refuses to promise reversal', asyn
   await f.dispatch('/cancel', 2);
   assert.match(f.messages.at(-1).text, /cannot guarantee reversal/);
   gate.resolve(); await expense; assert.equal(f.calls.writes, 1);
-  assert.match(f.messages.at(-1).text, /OK Logged/);
+  assert.equal(f.messages.at(-1).text, 'lunch $7.11\nCategory: Food & Drinks\nAccount: Cash');
 });
 
 test('failed budget switch does not leak execution across routes; later queue work recovers', async t => {
